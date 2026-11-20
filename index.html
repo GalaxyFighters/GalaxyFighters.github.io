@@ -32,7 +32,7 @@ const flights=(()=>{
 const formationSlots=[[-1,1],[-1,3],[1,1],[1,3],[-1,2],[-1,4],[1,2],[1,4],[-3,0],[-3,1],[-1,0],[3,1],[1,0],[-3,2],[3,0],[3,2],[7,1],[5,1],[7,2],[5,2],[-7,1],[-5,1],[-7,2],[-5,2],[5,3],[3,3],[5,4],[3,4],[-3,3],[-5,3],[-3,4],[-5,4],[-9,3],[-7,3],[-9,4],[-7,4],[7,3],[9,3],[7,4],[9,4]];
 function wave(s){
  s.wave++;s.waveAt=s.t;s.dive=3;s.enemyShot=2;
- s.foes=flights.map(([delay,family,points],i)=>({slot:formationSlots[i],delay:delay/entryRate,points,r:family===1?0:family===2?1:2,x:-100,y:-100,code:14,flags:0,h:family===1?2:1,d:0,side:1,aim:0,ready:false}));
+ s.foes=flights.map(([delay,family,points],i)=>({slot:formationSlots[i],delay:delay/entryRate,points,r:family===1?0:family===2?1:2,x:-100,y:-100,code:14,flags:0,h:Array(2).fill(family===1?2:1),d:0,side:1,aim:0,ready:false}));
  place(s,0)
 }
 function fresh(){let s={effects:[],events:{},p:[{x:200,h:3,flash:0},{x:200,h:3,flash:0}],shots:[],foes:[],wave:0,t:0,cool:[0,0],enemyShot:1.6,dive:3,over:false,winner:-2};wave(s);return s}
@@ -47,7 +47,7 @@ function chooseDifficulty(){
 }
 function solo(){role='ai';start()}
 let broker=null,channel=null,inbox=[],connectionTimer;
-const roomPrefix='dragonai-galaxy-fighters-v2-';
+const roomPrefix='dragonai-galaxy-fighters-v3-';
 const alphabet='ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 function roomCode(){
   return Array.from(crypto.getRandomValues(new Uint8Array(6)),n=>alphabet[n%alphabet.length]).join('');
@@ -144,12 +144,25 @@ function place(s,dt){
 function hurt(s,i){const p=s.p[i];if(p.flash<=0&&p.h>0){p.h--;p.flash=.64;s.effects.push([p.x,i?64:576,s.t,1]);soundEvent(s,4)}}
 function aiTarget(s){let p=s.p[1],danger=s.shots.filter(b=>b.v<0&&b.y>64&&b.y<205&&Math.abs(b.x-p.x)<26).sort((a,b)=>a.y-b.y)[0];if(danger)return limit(danger.x+(p.x>danger.x?1:p.x<danger.x?-1:p.x<200?1:-1)*46,18,382);return limit(s.p[0].x+Math.sin(s.t*2.3)*47,18,382)}
 function step(s,dt){if(s.over)return;s.t+=dt;s.effects=s.effects.filter(f=>s.t-f[2]<.45);const aims=[local,role==='ai'?aiTarget(s):peer];s.p.forEach((p,i)=>{let speed=i&&role==='ai'?174:310;p.x+=limit(aims[i]-p.x,-speed*dt,speed*dt);p.flash=Math.max(0,p.flash-dt)});for(let i=0;i<2;i++){s.cool[i]=Math.max(0,s.cool[i]-dt);let wants=i?(role==='ai'||peerFire||peerQueued):(firing||queued);if(wants&&s.cool[i]<=0){s.shots.push({x:s.p[i].x,y:i?83:557,v:i?355:-355,o:i});soundEvent(s,15);s.cool[i]=i===1&&role==='ai'?aiCooldown[difficulty]:.18;if(i)peerQueued=false;else queued=false}}
-place(s,dt);s.enemyShot-=dt;s.dive-=dt;const active=s.foes.filter(e=>e.x>=0&&e.x<=400);if(active.length){if(s.enemyShot<=0){s.enemyShot=Math.max(.38,1.12-.07*s.wave);let e=active[Math.floor(Math.random()*active.length)];s.shots.push({x:e.x,y:e.y,v:-155,o:2},{x:e.x,y:640-e.y,v:155,o:2})}if(s.dive<=0){s.dive=Math.max(1.1,3-.12*s.wave);let f=active.filter(e=>e.ready&&!e.d);if(f.length){let e=f[Math.floor(Math.random()*f.length)];e.aim=(s.p[0].x+s.p[1].x)/2;e.d=.001;soundEvent(s,19)}}}
+place(s,dt);s.enemyShot-=dt;s.dive-=dt;const active=s.foes.filter(e=>e.x>=0&&e.x<=400);if(active.length){if(s.enemyShot<=0){s.enemyShot=Math.max(.38,1.12-.07*s.wave);let e=active[Math.floor(Math.random()*active.length)];if(e.h[0])s.shots.push({x:e.x,y:e.y,v:-155,o:2});if(e.h[1])s.shots.push({x:e.x,y:640-e.y,v:155,o:2})}if(s.dive<=0){s.dive=Math.max(1.1,3-.12*s.wave);let f=active.filter(e=>e.ready&&!e.d);if(f.length){let e=f[Math.floor(Math.random()*f.length)];e.aim=(s.p[0].x+s.p[1].x)/2;e.d=.001;soundEvent(s,19)}}}
 for(const e of s.foes){
  if(!e.ready)continue;
- for(let i=0;i<2;i++)if(Math.abs(e.x-s.p[i].x)<16&&Math.abs((i?e.y:640-e.y)-(i?64:576))<14)hurt(s,i);
+ for(let i=0;i<2;i++)if(e.h[1-i]&&Math.abs(e.x-s.p[i].x)<16&&Math.abs((i?e.y:640-e.y)-(i?64:576))<14)hurt(s,i);
 }
-s.shots=s.shots.filter(b=>{b.y+=b.v*dt;if(b.y<43||b.y>598)return false;if(b.o<2){let e=s.foes.find(e=>e.h>0&&Math.abs(e.x-b.x)<12&&Math.min(Math.abs(e.y-b.y),Math.abs(640-e.y-b.y))<11);if(e){e.h--;soundEvent(s,e.h?4:[1,2,3][e.r]);if(!e.h){s.effects.push([e.x,e.y,s.t,0],[e.x,640-e.y,s.t,0])}return false}}let i=b.v>0?0:1;if(Math.abs(b.y-(i?64:576))<11&&Math.abs(b.x-s.p[i].x)<11){hurt(s,i);return false}return true});s.foes=s.foes.filter(e=>e.h>0);if(s.p.some(p=>!p.h)){s.over=true;s.winner=s.p[0].h?s.p[1].h?-1:0:s.p[1].h?1:-1}else if(!s.foes.length){wave(s);soundEvent(s,21)}}
+s.shots=s.shots.filter(b=>{b.y+=b.v*dt;if(b.y<43||b.y>598)return false;if(b.o<2){
+ for(const e of s.foes){
+  if(Math.abs(e.x-b.x)>=12)continue;
+  // At an overlap, resolve the nearer living invader first.
+  const top=Math.abs(e.y-b.y),bottom=Math.abs(640-e.y-b.y);
+  const hitTop=e.h[0]>0&&top<11,hitBottom=e.h[1]>0&&bottom<11;
+  if(!hitTop&&!hitBottom)continue;
+  const side=hitTop&&(!hitBottom||top<bottom||(top===bottom&&b.v>0))?0:1;
+  e.h[side]--;
+  soundEvent(s,e.h[side]?4:[1,2,3][e.r]);
+  if(!e.h[side])s.effects.push([e.x,side?640-e.y:e.y,s.t,0]);
+  return false;
+ }
+}let i=b.v>0?0:1;if(Math.abs(b.y-(i?64:576))<11&&Math.abs(b.x-s.p[i].x)<11){hurt(s,i);return false}return true});s.foes=s.foes.filter(e=>e.h[0]||e.h[1]);if(s.p.some(p=>!p.h)){s.over=true;s.winner=s.p[0].h?s.p[1].h?-1:0:s.p[1].h?1:-1}else if(!s.foes.length){wave(s);soundEvent(s,21)}}
 function snapshot(){return [state.p,state.wave,state.over,state.winner,state.foes.filter(e=>e.x>=-16).map(e=>[Math.round(e.x),Math.round(e.y),e.r,e.code,e.flags,e.h]),state.shots.map(b=>[Math.round(b.x),Math.round(b.y),b.o,b.v]),state.effects,state.t,state.events]}
 function restore(a){return {p:a[0],wave:a[1],over:a[2],winner:a[3],foes:a[4].map(([x,y,r,code,flags,h])=>({x,y,r,code,flags,h})),shots:a[5].map(([x,y,o,v])=>({x,y,o,v})),effects:a[6],t:a[7],events:a[8]}}
 function packet(now){for(let k=0;k<6;k++){let raw=Net.recv();if(!raw)break;let m;try{m=JSON.parse(raw)}catch(e){continue}if(!Array.isArray(m))continue;
@@ -165,10 +178,13 @@ function draw(){
  g.save();if(rev){g.translate(400,640);g.rotate(Math.PI)}
  for(const e of s.foes){
   if(e.x< -16)continue;
-  const palette=e.r===0?(e.h===1?1:0):e.r===1?2:3;
   const fx=Boolean(e.flags&2),fy=Boolean(e.flags&1);
-  sprite(g,e.code,palette,e.x,e.y,1.55,fx,!fy);
-  sprite(g,e.code,palette,e.x,640-e.y,1.55,fx,fy);
+  for(let side=0;side<2;side++){
+   const health=e.h[side];
+   if(!health)continue;
+   const palette=e.r===0?(health===1?1:0):e.r===1?2:3;
+   sprite(g,e.code,palette,e.x,side?640-e.y:e.y,1.55,fx,side?fy:!fy);
+  }
  }
  for(const b of s.shots)sprite(g,48,b.o===2?11:9,b.x,b.y,1.25,false,b.v>0);
  for(let i=0;i<2;i++){const p=s.p[i];if(p.h&&(!p.flash||Math.floor(p.flash*15)%2===0))sprite(g,6,9,p.x,i?64:576,1.75,false,!!i)}
