@@ -121,6 +121,7 @@ function joinForm(){
 }
 function ended(title,copy){mode='done';panel.hidden=false;menu(title,copy,role==='ai'?[['Play again',solo],['Change difficulty',chooseDifficulty],['Main menu',home]]:[['Main menu',home]])}
 function result(){const me=role==='guest'?1:0;let w=state.winner;ended(w===-1?'Draw':w===me?'Victory':'Defeat',w===-1?'Both fighters fell on the same volley.':w===me?'Your fighter survived the duel.':'The opposing pilot survived the duel.')}
+const formationSpeed=0.7;
 function place(s,dt){
  for(const e of s.foes){
   const progress=(s.t-s.waveAt-e.delay)*entryRate;if(progress<0)continue;
@@ -132,12 +133,12 @@ function place(s,dt){
   // Keep the arcade loops, then guide their final approach into one shared grid.
   const dock=Math.max(0,Math.min(1,1+(progress-end)/36));
   const blend=dock*dock*(3-2*dock);
-  const centerX=200+12*Math.sin((s.t-s.waveAt)*1.5);
+  const centerX=200+12*Math.sin((s.t-s.waveAt)*1.5*formationSpeed);
   const dockX=centerX+14*e.slot[0],dockY=320-(4.5-e.slot[1])*24;
   bx+=(dockX-arenaScale*e.points[end][0])*blend;
   by+=(dockY-(28+arenaScale*e.points[end][1]))*blend;
   if(e.ready){e.code=[14,22,30][e.r]+(Math.floor(s.t*4)%2);e.flags=0}
-  if(e.d){e.d+=dt*.54;if(e.d>=1)e.d=0;const reach=Math.sin(Math.PI*e.d);e.x=bx+(e.aim-bx)*reach+32*Math.sin(2*Math.PI*e.d);e.y=by+(64-by)*reach;e.code=[8,16,24][e.r]+Math.min(6,Math.round(6*Math.abs(Math.cos(e.d*Math.PI))));e.flags=e.d<.5?1:0}
+  if(e.d){e.d+=dt*.54*formationSpeed;if(e.d>=1)e.d=0;const reach=Math.sin(Math.PI*e.d);e.x=bx+(e.aim-bx)*reach+32*Math.sin(2*Math.PI*e.d);e.y=by+(64-by)*reach;e.code=[8,16,24][e.r]+Math.min(6,Math.round(6*Math.abs(Math.cos(e.d*Math.PI))));e.flags=e.d<.5?1:0}
   else{e.x=bx;e.y=by}
  }
 }
