@@ -150,18 +150,19 @@ for(const e of s.foes){
  for(let i=0;i<2;i++)if(e.h[1-i]&&Math.abs(e.x-s.p[i].x)<16&&Math.abs((i?e.y:640-e.y)-(i?64:576))<14)hurt(s,i);
 }
 s.shots=s.shots.filter(b=>{b.y+=b.v*dt;if(b.y<43||b.y>598)return false;if(b.o<2){
+ let hit=false;
  for(const e of s.foes){
   if(Math.abs(e.x-b.x)>=12)continue;
-  // At an overlap, resolve the nearer living invader first.
-  const top=Math.abs(e.y-b.y),bottom=Math.abs(640-e.y-b.y);
-  const hitTop=e.h[0]>0&&top<11,hitBottom=e.h[1]>0&&bottom<11;
-  if(!hitTop&&!hitBottom)continue;
-  const side=hitTop&&(!hitBottom||top<bottom||(top===bottom&&b.v>0))?0:1;
-  e.h[side]--;
-  soundEvent(s,e.h[side]?4:[1,2,3][e.r]);
-  if(!e.h[side])s.effects.push([e.x,side?640-e.y:e.y,s.t,0]);
-  return false;
+  for(let side=0;side<2;side++){
+   const y=side?640-e.y:e.y;
+   if(!e.h[side]||Math.abs(y-b.y)>=11)continue;
+   hit=true;
+   e.h[side]--;
+   soundEvent(s,e.h[side]?4:[1,2,3][e.r]);
+   if(!e.h[side])s.effects.push([e.x,y,s.t,0]);
+  }
  }
+ if(hit)return false;
 }let i=b.v>0?0:1;if(Math.abs(b.y-(i?64:576))<11&&Math.abs(b.x-s.p[i].x)<11){hurt(s,i);return false}return true});s.foes=s.foes.filter(e=>e.h[0]||e.h[1]);if(s.p.some(p=>!p.h)){s.over=true;s.winner=s.p[0].h?s.p[1].h?-1:0:s.p[1].h?1:-1}else if(!s.foes.length){wave(s);soundEvent(s,21)}}
 function snapshot(){return [state.p,state.wave,state.over,state.winner,state.foes.filter(e=>e.x>=-16).map(e=>[Math.round(e.x),Math.round(e.y),e.r,e.code,e.flags,e.h]),state.shots.map(b=>[Math.round(b.x),Math.round(b.y),b.o,b.v]),state.effects,state.t,state.events]}
 function restore(a){return {p:a[0],wave:a[1],over:a[2],winner:a[3],foes:a[4].map(([x,y,r,code,flags,h])=>({x,y,r,code,flags,h})),shots:a[5].map(([x,y,o,v])=>({x,y,o,v})),effects:a[6],t:a[7],events:a[8]}}
