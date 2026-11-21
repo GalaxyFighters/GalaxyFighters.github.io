@@ -1,0 +1,3270 @@
+// Board and CPU dependencies pinned to iapx86/JavaScript 9ca520534893f4348274aa24b979d99697f3102d.
+/*
+ *
+ *	Utilities
+ *
+ */
+
+const seq = (n, s = 0, d = 1) => new Array(n).fill(0).map((e, i) => s + i * d);
+const rseq = (n, s = 0, d = 1) => new Array(n).fill(0).map((e, i) => s + (n - i - 1) * d);
+const bitswap = (val, ...args) => args.reduce((a, b) => a << 1 | val >> b & 1, 0);
+
+function convertGFX(dst, src, n, x, y, z, d) {
+	for (let p = 0, q = 0, i = 0; i < n; q += d, i++)
+		y.forEach(y => x.forEach(x => dst[p++] ^= z.reduce((a, z) => a << 1 | (z >= 0 && ~src[q | x + y + z >> 3] >> (x + y + z & 7 ^ 7) & 1), 0)));
+}
+
+class Timer {
+	rate = 0;
+	frac = 0;
+	fn = () => {};
+
+	constructor(rate = 0) {
+		this.rate = rate;
+	}
+
+	execute(rate, fn = this.fn) {
+		for (this.frac += this.rate; this.frac >= rate; this.frac -= rate)
+			fn();
+	}
+}
+
+/*
+ *
+ *	CPU Common Module
+ *
+ */
+
+const dummypage = new Uint8Array(0x100).fill(0xff);
+
+class Cpu {
+	fActive = false;
+	fSuspend = false;
+	pc = 0;
+	memorymap = [];
+	check_interrupt = Cpu.dummy_handler;
+	breakpointmap = new Int32Array(0x800);
+	breakpoint = Cpu.dummy_handler;
+	undef = Cpu.dummy_handler;
+	undefsize = 0;
+	clock = 0;
+	frac = 0;
+	cycle = 0;
+
+	constructor(clock = 0) {
+		for (let i = 0; i < 0x100; i++)
+			this.memorymap.push({base: dummypage, read: null, write: () => {}, fetch: null});
+		this.clock = clock;
+	}
+
+	set_breakpoint(addr) {
+		this.breakpointmap[addr >> 5] |= 1 << (addr & 0x1f);
+	}
+
+	clear_breakpoint(addr) {
+		this.breakpointmap[addr >> 5] &= ~(1 << (addr & 0x1f));
+	}
+
+	clear_all_breakpoint() {
+		this.breakpointmap.fill(0);
+	}
+
+	reset() {
+		this.fActive = true;
+		this.fSuspend = false;
+		this.frac = 0;
+		this.cycle = 0;
+	}
+
+	enable() {
+		if (this.fActive)
+			return;
+		this.reset();
+	}
+
+	disable() {
+		this.fActive = false;
+	}
+
+	suspend() {
+		if (!this.fActive || this.fSuspend)
+			return;
+		this.fSuspend = true;
+	}
+
+	resume() {
+		if (!this.fActive || !this.fSuspend)
+			return;
+		this.fSuspend = false;
+	}
+
+	interrupt() {
+		if (!this.fActive)
+			return false;
+		this.resume();
+		return true;
+	}
+
+	execute(rate) {
+		if (!this.fActive)
+			return;
+		for (this.cycle += Math.floor((this.frac += this.clock) / rate), this.frac %= rate; this.cycle > 0;) {
+			if (this.check_interrupt !== Cpu.dummy_handler && this.check_interrupt())
+				continue;
+			if (this.fSuspend)
+				return void(this.cycle = 0);
+			if (this.breakpoint !== Cpu.dummy_handler && this.breakpointmap[this.pc >>> 5] >> (this.pc & 31) & 1)
+				this.breakpoint(this.pc);
+			this._execute();
+		}
+	}
+
+	execute1() {
+		if (!this.fActive || this.check_interrupt && this.check_interrupt() || this.fSuspend)
+			return;
+		if (this.breakpoint && this.breakpointmap[this.pc >>> 5] >> (this.pc & 31) & 1)
+			this.breakpoint(this.pc);
+		this._execute();
+	}
+
+	_execute() {
+	}
+
+	fetch() {
+//		const page = this.memorymap[this.pc >> 8];
+//		const data = !page.fetch ? page.base[this.pc & 0xff] : page.fetch(this.pc);
+		const data = this.memorymap[this.pc >> 8].base[this.pc & 0xff];
+		this.pc = this.pc + 1 & 0xffff;
+		return data;
+	}
+
+	read(addr) {
+		const page = this.memorymap[addr >> 8];
+		return !page.read ? page.base[addr & 0xff] : page.read(addr);
+	}
+
+	write(addr, data) {
+		const page = this.memorymap[addr >> 8];
+		!page.write ? void(page.base[addr & 0xff] = data) : page.write(addr, data);
+	}
+
+	static dummy_handler() {}
+}
+
+/*
+ *
+ *	Z80 Emulator
+ *
+ */
+
+
+class Z80 extends Cpu {
+	b = 0;
+	c = 0;
+	d = 0;
+	e = 0;
+	h = 0;
+	l = 0;
+	a = 0;
+	f = 0; // f:sz-h-pnc
+	ixh = 0;
+	ixl = 0;
+	iyh = 0;
+	iyl = 0;
+	iff = 0;
+	im = 0;
+	i = 0;
+	r = 0;
+	b_prime = 0;
+	c_prime = 0;
+	d_prime = 0;
+	e_prime = 0;
+	h_prime = 0;
+	l_prime = 0;
+	a_prime = 0;
+	f_prime = 0;
+	sp = 0;
+	iomap = [];
+
+	constructor(clock) {
+		super(clock);
+		for (let i = 0; i < 0x100; i++)
+			this.iomap.push({base: dummypage, read: null, write: () => {}});
+	}
+
+	reset() {
+		super.reset();
+		this.iff = 0;
+		this.im = 0;
+		this.pc = 0;
+		this.i = 0;
+		this.r = 0;
+		this.b = 0xff;
+		this.c = 0xff;
+		this.d = 0xff;
+		this.e = 0xff;
+		this.h = 0xff;
+		this.l = 0xff;
+		this.a = 0xff;
+		this.f = 0xff;
+		this.ixh = 0xff;
+		this.ixl = 0xff;
+		this.iyh = 0xff;
+		this.iyl = 0xff;
+		this.b_prime = 0xff;
+		this.c_prime = 0xff;
+		this.d_prime = 0xff;
+		this.e_prime = 0xff;
+		this.h_prime = 0xff;
+		this.l_prime = 0xff;
+		this.a_prime = 0xff;
+		this.f_prime = 0xff;
+		this.sp = 0xffff;
+	}
+
+	interrupt(intvec = 0xff) {
+		if (!super.interrupt() || this.iff !== 3)
+			return false;
+		this.iff = 0;
+		switch (this.im) {
+		case 0:
+			this.cycle -= cc_op[intvec] + cc_ex[0xff];
+			switch (intvec) {
+			case 0xc7: // RST 00h
+				return this.rst(0x00), true;
+			case 0xcf: // RST 08h
+				return this.rst(0x08), true;
+			case 0xd7: // RST 10h
+				return this.rst(0x10), true;
+			case 0xdf: // RST 18h
+				return this.rst(0x18), true;
+			case 0xe7: // RST 20h
+				return this.rst(0x20), true;
+			case 0xef: // RST 28h
+				return this.rst(0x28), true;
+			case 0xf7: // RST 30h
+				return this.rst(0x30), true;
+			case 0xff: // RST 38h
+				return this.rst(0x38), true;
+			}
+			break;
+		case 1:
+			return this.cycle -= cc_op[0xff] + cc_ex[0xff], this.rst(0x38), true;
+		case 2:
+			return this.cycle -= cc_op[0xcd] + cc_ex[0xff], this.rst(this.read16(intvec & 0xff | this.i << 8)), true;
+		}
+		return true;
+	}
+
+	non_maskable_interrupt() {
+		if (!super.interrupt())
+			return false;
+		return this.cycle -= 11, this.iff &= 2, this.rst(0x66), true;
+	}
+
+	_execute() {
+		let v, op = this.fetchM1();
+		this.cycle -= cc_op[op], this.r = this.r & 0x80 | this.r + 1 & 0x7f;
+		switch (op) {
+		case 0x00: // NOP
+			return;
+		case 0x01: // LD BC,nn
+			return void([this.c, this.b] = this.split(this.fetch16()));
+		case 0x02: // LD (BC),A
+			return this.write(this.c | this.b << 8, this.a);
+		case 0x03: // INC BC
+			return void([this.c, this.b] = this.split((this.c | this.b << 8) + 1 & 0xffff));
+		case 0x04: // INC B
+			return void(this.b = this.inc8(this.b));
+		case 0x05: // DEC B
+			return void(this.b = this.dec8(this.b));
+		case 0x06: // LD B,n
+			return void(this.b = this.fetch());
+		case 0x07: // RLCA
+			return this.f = this.f & ~0x13 | this.a >> 7, void(this.a = this.a << 1 & 0xfe | this.a >> 7);
+		case 0x08: // EX AF,AF'
+			return void([this.f, this.a, this.f_prime, this.a_prime] = [this.f_prime, this.a_prime, this.f, this.a]);
+		case 0x09: // ADD HL,BC
+			return void([this.l, this.h] = this.split(this.add16(this.l | this.h << 8, this.c | this.b << 8)));
+		case 0x0a: // LD A,(BC)
+			return void(this.a = this.read(this.c | this.b << 8));
+		case 0x0b: // DEC BC
+			return void([this.c, this.b] = this.split((this.c | this.b << 8) - 1 & 0xffff));
+		case 0x0c: // INC C
+			return void(this.c = this.inc8(this.c));
+		case 0x0d: // DEC C
+			return void(this.c = this.dec8(this.c));
+		case 0x0e: // LD C,n
+			return void(this.c = this.fetch());
+		case 0x0f: // RRCA
+			return this.f = this.f & ~0x13 | this.a & 1, void(this.a = this.a << 7 & 0x80 | this.a >> 1);
+		case 0x10: // DJNZ e
+			return (this.b = this.b - 1 & 0xff) && (this.cycle -= cc_ex[0x10]), this.jr(this.b !== 0);
+		case 0x11: // LD DE,nn
+			return void([this.e, this.d] = this.split(this.fetch16()));
+		case 0x12: // LD (DE),A
+			return this.write(this.e | this.d << 8, this.a);
+		case 0x13: // INC DE
+			return void([this.e, this.d] = this.split((this.e | this.d << 8) + 1 & 0xffff));
+		case 0x14: // INC D
+			return void(this.d = this.inc8(this.d));
+		case 0x15: // DEC D
+			return void(this.d = this.dec8(this.d));
+		case 0x16: // LD D,n
+			return void(this.d = this.fetch());
+		case 0x17: // RLA
+			return v = this.a << 1 | this.f & 1, this.f = this.f & ~0x13 | v >> 8, void(this.a = v & 0xff);
+		case 0x18: // JR e
+			return this.jr(true);
+		case 0x19: // ADD HL,DE
+			return void([this.l, this.h] = this.split(this.add16(this.l | this.h << 8, this.e | this.d << 8)));
+		case 0x1a: // LD A,(DE)
+			return void(this.a = this.read(this.e | this.d << 8));
+		case 0x1b: // DEC DE
+			return void([this.e, this.d] = this.split((this.e | this.d << 8) - 1 & 0xffff));
+		case 0x1c: // INC E
+			return void(this.e = this.inc8(this.e));
+		case 0x1d: // DEC E
+			return void(this.e = this.dec8(this.e));
+		case 0x1e: // LD E,n
+			return void(this.e = this.fetch());
+		case 0x1f: // RRA
+			return v = this.f << 8 | this.a, this.f = this.f & ~0x13 | v & 1, void(this.a = v >> 1 & 0xff);
+		case 0x20: // JR NZ,e
+			return !(this.f & 0x40) && (this.cycle -= cc_ex[0x20]), this.jr(!(this.f & 0x40));
+		case 0x21: // LD HL,nn
+			return void([this.l, this.h] = this.split(this.fetch16()));
+		case 0x22: // LD (nn),HL
+			return this.write16(this.fetch16(), this.l | this.h << 8);
+		case 0x23: // INC HL
+			return void([this.l, this.h] = this.split((this.l | this.h << 8) + 1 & 0xffff));
+		case 0x24: // INC H
+			return void(this.h = this.inc8(this.h));
+		case 0x25: // DEC H
+			return void(this.h = this.dec8(this.h));
+		case 0x26: // LD H,n
+			return void(this.h = this.fetch());
+		case 0x27: // DAA
+			return this.daa();
+		case 0x28: // JR Z,e
+			return this.f & 0x40 && (this.cycle -= cc_ex[0x28]), this.jr((this.f & 0x40) !== 0);
+		case 0x29: // ADD HL,HL
+			return void([this.l, this.h] = this.split(this.add16(this.l | this.h << 8, this.l | this.h << 8)));
+		case 0x2a: // LD HL,(nn)
+			return void([this.l, this.h] = this.split(this.read16(this.fetch16())));
+		case 0x2b: // DEC HL
+			return void([this.l, this.h] = this.split((this.l | this.h << 8) - 1 & 0xffff));
+		case 0x2c: // INC L
+			return void(this.l = this.inc8(this.l));
+		case 0x2d: // DEC L
+			return void(this.l = this.dec8(this.l));
+		case 0x2e: // LD L,n
+			return void(this.l = this.fetch());
+		case 0x2f: // CPL
+			return this.f |= 0x12, void(this.a ^= 0xff);
+		case 0x30: // JR NC,e
+			return !(this.f & 1) && (this.cycle -= cc_ex[0x30]), this.jr(!(this.f & 1));
+		case 0x31: // LD SP,nn
+			return void(this.sp = this.fetch16());
+		case 0x32: // LD (nn),A
+			return this.write(this.fetch16(), this.a);
+		case 0x33: // INC SP
+			return void(this.sp = this.sp + 1 & 0xffff);
+		case 0x34: // INC (HL)
+			return v = this.l | this.h << 8, this.write(v, this.inc8(this.read(v)));
+		case 0x35: // DEC (HL)
+			return v = this.l | this.h << 8, this.write(v, this.dec8(this.read(v)));
+		case 0x36: // LD (HL),n
+			return this.write(this.l | this.h << 8, this.fetch());
+		case 0x37: // SCF
+			return void(this.f = this.f & ~0x12 | 1);
+		case 0x38: // JR C,e
+			return this.f & 1 && (this.cycle -= cc_ex[0x38]), this.jr((this.f & 1) !== 0);
+		case 0x39: // ADD HL,SP
+			return void([this.l, this.h] = this.split(this.add16(this.l | this.h << 8, this.sp)));
+		case 0x3a: // LD A,(nn)
+			return void(this.a = this.read(this.fetch16()));
+		case 0x3b: // DEC SP
+			return void(this.sp = this.sp - 1 & 0xffff);
+		case 0x3c: // INC A
+			return void(this.a = this.inc8(this.a));
+		case 0x3d: // DEC A
+			return void(this.a = this.dec8(this.a));
+		case 0x3e: // LD A,n
+			return void(this.a = this.fetch());
+		case 0x3f: // CCF
+			return void(this.f = this.f & ~0x12 ^ 1 | this.f << 4 & 0x10);
+		case 0x40: // LD B,B
+			return;
+		case 0x41: // LD B,C
+			return void(this.b = this.c);
+		case 0x42: // LD B,D
+			return void(this.b = this.d);
+		case 0x43: // LD B,E
+			return void(this.b = this.e);
+		case 0x44: // LD B,H
+			return void(this.b = this.h);
+		case 0x45: // LD B,L
+			return void(this.b = this.l);
+		case 0x46: // LD B,(HL)
+			return void(this.b = this.read(this.l | this.h << 8));
+		case 0x47: // LD B,A
+			return void(this.b = this.a);
+		case 0x48: // LD C,B
+			return void(this.c = this.b);
+		case 0x49: // LD C,C
+			return;
+		case 0x4a: // LD C,D
+			return void(this.c = this.d);
+		case 0x4b: // LD C,E
+			return void(this.c = this.e);
+		case 0x4c: // LD C,H
+			return void(this.c = this.h);
+		case 0x4d: // LD C,L
+			return void(this.c = this.l);
+		case 0x4e: // LD C,(HL)
+			return void(this.c = this.read(this.l | this.h << 8));
+		case 0x4f: // LD C,A
+			return void(this.c = this.a);
+		case 0x50: // LD D,B
+			return void(this.d = this.b);
+		case 0x51: // LD D,C
+			return void(this.d = this.c);
+		case 0x52: // LD D,D
+			return;
+		case 0x53: // LD D,E
+			return void(this.d = this.e);
+		case 0x54: // LD D,H
+			return void(this.d = this.h);
+		case 0x55: // LD D,L
+			return void(this.d = this.l);
+		case 0x56: // LD D,(HL)
+			return void(this.d = this.read(this.l | this.h << 8));
+		case 0x57: // LD D,A
+			return void(this.d = this.a);
+		case 0x58: // LD E,B
+			return void(this.e = this.b);
+		case 0x59: // LD E,C
+			return void(this.e = this.c);
+		case 0x5a: // LD E,D
+			return void(this.e = this.d);
+		case 0x5b: // LD E,E
+			return;
+		case 0x5c: // LD E,H
+			return void(this.e = this.h);
+		case 0x5d: // LD E,L
+			return void(this.e = this.l);
+		case 0x5e: // LD E,(HL)
+			return void(this.e = this.read(this.l | this.h << 8));
+		case 0x5f: // LD E,A
+			return void(this.e = this.a);
+		case 0x60: // LD H,B
+			return void(this.h = this.b);
+		case 0x61: // LD H,C
+			return void(this.h = this.c);
+		case 0x62: // LD H,D
+			return void(this.h = this.d);
+		case 0x63: // LD H,E
+			return void(this.h = this.e);
+		case 0x64: // LD H,H
+			return;
+		case 0x65: // LD H,L
+			return void(this.h = this.l);
+		case 0x66: // LD H,(HL)
+			return void(this.h = this.read(this.l | this.h << 8));
+		case 0x67: // LD H,A
+			return void(this.h = this.a);
+		case 0x68: // LD L,B
+			return void(this.l = this.b);
+		case 0x69: // LD L,C
+			return void(this.l = this.c);
+		case 0x6a: // LD L,D
+			return void(this.l = this.d);
+		case 0x6b: // LD L,E
+			return void(this.l = this.e);
+		case 0x6c: // LD L,H
+			return void(this.l = this.h);
+		case 0x6d: // LD L,L
+			return;
+		case 0x6e: // LD L,(HL)
+			return void(this.l = this.read(this.l | this.h << 8));
+		case 0x6f: // LD L,A
+			return void(this.l = this.a);
+		case 0x70: // LD (HL),B
+			return this.write(this.l | this.h << 8, this.b);
+		case 0x71: // LD (HL),C
+			return this.write(this.l | this.h << 8, this.c);
+		case 0x72: // LD (HL),D
+			return this.write(this.l | this.h << 8, this.d);
+		case 0x73: // LD (HL),E
+			return this.write(this.l | this.h << 8, this.e);
+		case 0x74: // LD (HL),H
+			return this.write(this.l | this.h << 8, this.h);
+		case 0x75: // LD (HL),L
+			return this.write(this.l | this.h << 8, this.l);
+		case 0x76: // HALT
+			return this.suspend();
+		case 0x77: // LD (HL),A
+			return this.write(this.l | this.h << 8, this.a);
+		case 0x78: // LD A,B
+			return void(this.a = this.b);
+		case 0x79: // LD A,C
+			return void(this.a = this.c);
+		case 0x7a: // LD A,D
+			return void(this.a = this.d);
+		case 0x7b: // LD A,E
+			return void(this.a = this.e);
+		case 0x7c: // LD A,H
+			return void(this.a = this.h);
+		case 0x7d: // LD A,L
+			return void(this.a = this.l);
+		case 0x7e: // LD A,(HL)
+			return void(this.a = this.read(this.l | this.h << 8));
+		case 0x7f: // LD A,A
+			return;
+		case 0x80: // ADD A,B
+			return void(this.a = this.add8(this.a, this.b));
+		case 0x81: // ADD A,C
+			return void(this.a = this.add8(this.a, this.c));
+		case 0x82: // ADD A,D
+			return void(this.a = this.add8(this.a, this.d));
+		case 0x83: // ADD A,E
+			return void(this.a = this.add8(this.a, this.e));
+		case 0x84: // ADD A,H
+			return void(this.a = this.add8(this.a, this.h));
+		case 0x85: // ADD A,L
+			return void(this.a = this.add8(this.a, this.l));
+		case 0x86: // ADD A,(HL)
+			return void(this.a = this.add8(this.a, this.read(this.l | this.h << 8)));
+		case 0x87: // ADD A,A
+			return void(this.a = this.add8(this.a, this.a));
+		case 0x88: // ADC A,B
+			return void(this.a = this.adc8(this.a, this.b));
+		case 0x89: // ADC A,C
+			return void(this.a = this.adc8(this.a, this.c));
+		case 0x8a: // ADC A,D
+			return void(this.a = this.adc8(this.a, this.d));
+		case 0x8b: // ADC A,E
+			return void(this.a = this.adc8(this.a, this.e));
+		case 0x8c: // ADC A,H
+			return void(this.a = this.adc8(this.a, this.h));
+		case 0x8d: // ADC A,L
+			return void(this.a = this.adc8(this.a, this.l));
+		case 0x8e: // ADC A,(HL)
+			return void(this.a = this.adc8(this.a, this.read(this.l | this.h << 8)));
+		case 0x8f: // ADC A,A
+			return void(this.a = this.adc8(this.a, this.a));
+		case 0x90: // SUB B
+			return void(this.a = this.sub8(this.a, this.b));
+		case 0x91: // SUB C
+			return void(this.a = this.sub8(this.a, this.c));
+		case 0x92: // SUB D
+			return void(this.a = this.sub8(this.a, this.d));
+		case 0x93: // SUB E
+			return void(this.a = this.sub8(this.a, this.e));
+		case 0x94: // SUB H
+			return void(this.a = this.sub8(this.a, this.h));
+		case 0x95: // SUB L
+			return void(this.a = this.sub8(this.a, this.l));
+		case 0x96: // SUB (HL)
+			return void(this.a = this.sub8(this.a, this.read(this.l | this.h << 8)));
+		case 0x97: // SUB A
+			return void(this.a = this.sub8(this.a, this.a));
+		case 0x98: // SBC A,B
+			return void(this.a = this.sbc8(this.a, this.b));
+		case 0x99: // SBC A,C
+			return void(this.a = this.sbc8(this.a, this.c));
+		case 0x9a: // SBC A,D
+			return void(this.a = this.sbc8(this.a, this.d));
+		case 0x9b: // SBC A,E
+			return void(this.a = this.sbc8(this.a, this.e));
+		case 0x9c: // SBC A,H
+			return void(this.a = this.sbc8(this.a, this.h));
+		case 0x9d: // SBC A,L
+			return void(this.a = this.sbc8(this.a, this.l));
+		case 0x9e: // SBC A,(HL)
+			return void(this.a = this.sbc8(this.a, this.read(this.l | this.h << 8)));
+		case 0x9f: // SBC A,A
+			return void(this.a = this.sbc8(this.a, this.a));
+		case 0xa0: // AND B
+			return void(this.a = this.and8(this.a, this.b));
+		case 0xa1: // AND C
+			return void(this.a = this.and8(this.a, this.c));
+		case 0xa2: // AND D
+			return void(this.a = this.and8(this.a, this.d));
+		case 0xa3: // AND E
+			return void(this.a = this.and8(this.a, this.e));
+		case 0xa4: // AND H
+			return void(this.a = this.and8(this.a, this.h));
+		case 0xa5: // AND L
+			return void(this.a = this.and8(this.a, this.l));
+		case 0xa6: // AND (HL)
+			return void(this.a = this.and8(this.a, this.read(this.l | this.h << 8)));
+		case 0xa7: // AND A
+			return void(this.a = this.and8(this.a, this.a));
+		case 0xa8: // XOR B
+			return void(this.a = this.xor8(this.a, this.b));
+		case 0xa9: // XOR C
+			return void(this.a = this.xor8(this.a, this.c));
+		case 0xaa: // XOR D
+			return void(this.a = this.xor8(this.a, this.d));
+		case 0xab: // XOR E
+			return void(this.a = this.xor8(this.a, this.e));
+		case 0xac: // XOR H
+			return void(this.a = this.xor8(this.a, this.h));
+		case 0xad: // XOR L
+			return void(this.a = this.xor8(this.a, this.l));
+		case 0xae: // XOR (HL)
+			return void(this.a = this.xor8(this.a, this.read(this.l | this.h << 8)));
+		case 0xaf: // XOR A
+			return void(this.a = this.xor8(this.a, this.a));
+		case 0xb0: // OR B
+			return void(this.a = this.or8(this.a, this.b));
+		case 0xb1: // OR C
+			return void(this.a = this.or8(this.a, this.c));
+		case 0xb2: // OR D
+			return void(this.a = this.or8(this.a, this.d));
+		case 0xb3: // OR E
+			return void(this.a = this.or8(this.a, this.e));
+		case 0xb4: // OR H
+			return void(this.a = this.or8(this.a, this.h));
+		case 0xb5: // OR L
+			return void(this.a = this.or8(this.a, this.l));
+		case 0xb6: // OR (HL)
+			return void(this.a = this.or8(this.a, this.read(this.l | this.h << 8)));
+		case 0xb7: // OR A
+			return void(this.a = this.or8(this.a, this.a));
+		case 0xb8: // CP B
+			return void(this.sub8(this.a, this.b));
+		case 0xb9: // CP C
+			return void(this.sub8(this.a, this.c));
+		case 0xba: // CP D
+			return void(this.sub8(this.a, this.d));
+		case 0xbb: // CP E
+			return void(this.sub8(this.a, this.e));
+		case 0xbc: // CP H
+			return void(this.sub8(this.a, this.h));
+		case 0xbd: // CP L
+			return void(this.sub8(this.a, this.l));
+		case 0xbe: // CP (HL)
+			return void(this.sub8(this.a, this.read(this.l | this.h << 8)));
+		case 0xbf: // CP A
+			return void(this.sub8(this.a, this.a));
+		case 0xc0: // RET NZ
+			return !(this.f & 0x40) && (this.cycle -= cc_ex[0xc0]), this.ret(!(this.f & 0x40));
+		case 0xc1: // POP BC
+			return void([this.c, this.b] = this.split(this.pop16()));
+		case 0xc2: // JP NZ,nn
+			return this.jp(!(this.f & 0x40));
+		case 0xc3: // JP nn
+			return this.jp(true);
+		case 0xc4: // CALL NZ,nn
+			return !(this.f & 0x40) && (this.cycle -= cc_ex[0xc4]), this.call(!(this.f & 0x40));
+		case 0xc5: // PUSH BC
+			return this.push16(this.c | this.b << 8);
+		case 0xc6: // ADD A,n
+			return void(this.a = this.add8(this.a, this.fetch()));
+		case 0xc7: // RST 00h
+			return this.rst(0x00);
+		case 0xc8: // RET Z
+			return this.f & 0x40 && (this.cycle -= cc_ex[0xc8]), this.ret((this.f & 0x40) !== 0);
+		case 0xc9: // RET
+			return this.ret(true);
+		case 0xca: // JP Z,nn
+			return this.jp((this.f & 0x40) !== 0);
+		case 0xcb:
+			return this.execute_cb();
+		case 0xcc: // CALL Z,nn
+			return this.f & 0x40 && (this.cycle -= cc_ex[0xcc]), this.call((this.f & 0x40) !== 0);
+		case 0xcd: // CALL nn
+			return this.call(true);
+		case 0xce: // ADC A,n
+			return void(this.a = this.adc8(this.a, this.fetch()));
+		case 0xcf: // RST 08h
+			return this.rst(0x08);
+		case 0xd0: // RET NC
+			return !(this.f & 1) && (this.cycle -= cc_ex[0xd0]), this.ret(!(this.f & 1));
+		case 0xd1: // POP DE
+			return void([this.e, this.d] = this.split(this.pop16()));
+		case 0xd2: // JP NC,nn
+			return this.jp(!(this.f & 1));
+		case 0xd3: // OUT n,A
+			return this.iowrite(this.a, this.fetch(), this.a);
+		case 0xd4: // CALL NC,nn
+			return !(this.f & 1) && (this.cycle -= cc_ex[0xd4]), this.call(!(this.f & 1));
+		case 0xd5: // PUSH DE
+			return this.push16(this.e | this.d << 8);
+		case 0xd6: // SUB n
+			return void(this.a = this.sub8(this.a, this.fetch()));
+		case 0xd7: // RST 10h
+			return this.rst(0x10);
+		case 0xd8: // RET C
+			return this.f & 1 && (this.cycle -= cc_ex[0xd8]), this.ret((this.f & 1) !== 0);
+		case 0xd9: // EXX
+			[this.c, this.b, this.c_prime, this.b_prime] = [this.c_prime, this.b_prime, this.c, this.b];
+			[this.e, this.d, this.e_prime, this.d_prime] = [this.e_prime, this.d_prime, this.e, this.d];
+			[this.l, this.h, this.l_prime, this.h_prime] = [this.l_prime, this.h_prime, this.l, this.h];
+			return;
+		case 0xda: // JP C,nn
+			return this.jp((this.f & 1) !== 0);
+		case 0xdb: // IN A,n
+			return void(this.a = this.ioread(this.a, this.fetch()));
+		case 0xdc: // CALL C,nn
+			return this.f & 1 && (this.cycle -= cc_ex[0xdc]), this.call((this.f & 1) !== 0);
+		case 0xdd:
+			return this.execute_dd();
+		case 0xde: // SBC A,n
+			return void(this.a = this.sbc8(this.a, this.fetch()));
+		case 0xdf: // RST 18h
+			return this.rst(0x18);
+		case 0xe0: // RET PO
+			return !(this.f & 4) && (this.cycle -= cc_ex[0xe0]), this.ret(!(this.f & 4));
+		case 0xe1: // POP HL
+			return void([this.l, this.h] = this.split(this.pop16()));
+		case 0xe2: // JP PO,nn
+			return this.jp(!(this.f & 4));
+		case 0xe3: // EX (SP),HL
+			return v = this.l | this.h << 8, [this.l, this.h] = this.split(this.pop16()), this.push16(v);
+		case 0xe4: // CALL PO,nn
+			return !(this.f & 4) && (this.cycle -= cc_ex[0xe4]), this.call(!(this.f & 4));
+		case 0xe5: // PUSH HL
+			return this.push16(this.l | this.h << 8);
+		case 0xe6: // AND n
+			return void(this.a = this.and8(this.a, this.fetch()));
+		case 0xe7: // RST 20h
+			return this.rst(0x20);
+		case 0xe8: // RET PE
+			return this.f & 4 && (this.cycle -= cc_ex[0xe8]), this.ret((this.f & 4) !== 0);
+		case 0xe9: // JP (HL)
+			return void(this.pc = this.l | this.h << 8);
+		case 0xea: // JP PE,nn
+			return this.jp((this.f & 4) !== 0);
+		case 0xeb: // EX DE,HL
+			return void([this.e, this.d, this.l, this.h] = [this.l, this.h, this.e, this.d]);
+		case 0xec: // CALL PE,nn
+			return this.f & 4 && (this.cycle -= cc_ex[0xec]), this.call((this.f & 4) !== 0);
+		case 0xed:
+			return this.execute_ed();
+		case 0xee: // XOR n
+			return void(this.a = this.xor8(this.a, this.fetch()));
+		case 0xef: // RST 28h
+			return this.rst(0x28);
+		case 0xf0: // RET P
+			return !(this.f & 0x80) && (this.cycle -= cc_ex[0xf0]), this.ret(!(this.f & 0x80));
+		case 0xf1: // POP AF
+			return void([this.f, this.a] = this.split(this.pop16()));
+		case 0xf2: // JP P,nn
+			return this.jp(!(this.f & 0x80));
+		case 0xf3: // DI
+			return void(this.iff = 0);
+		case 0xf4: // CALL P,nn
+			return !(this.f & 0x80) && (this.cycle -= cc_ex[0xf4]), this.call(!(this.f & 0x80));
+		case 0xf5: // PUSH AF
+			return this.push16(this.f | this.a << 8);
+		case 0xf6: // OR n
+			return void(this.a = this.or8(this.a, this.fetch()));
+		case 0xf7: // RST 30h
+			return this.rst(0x30);
+		case 0xf8: // RET M
+			return this.f & 0x80 && (this.cycle -= cc_ex[0xf8]), this.ret((this.f & 0x80) !== 0);
+		case 0xf9: // LD SP,HL
+			return void(this.sp = this.l | this.h << 8);
+		case 0xfa: // JP M,nn
+			return this.jp((this.f & 0x80) !== 0);
+		case 0xfb: // EI
+			return void(this.iff = 3);
+		case 0xfc: // CALL M,nn
+			return this.f & 0x80 && (this.cycle -= cc_ex[0xfc]), this.call((this.f & 0x80) !== 0);
+		case 0xfd:
+			return this.execute_fd();
+		case 0xfe: // CP n
+			return void(this.sub8(this.a, this.fetch()));
+		case 0xff: // RST 38h
+			return this.rst(0x38);
+		}
+	}
+
+	execute_cb() {
+		let v, op = this.fetchM1();
+		this.cycle -= cc_cb[op], this.r = this.r & 0x80 | this.r + 1 & 0x7f;
+		switch (op) {
+		case 0x00: // RLC B
+			return void(this.b = this.rlc8(this.b));
+		case 0x01: // RLC C
+			return void(this.c = this.rlc8(this.c));
+		case 0x02: // RLC D
+			return void(this.d = this.rlc8(this.d));
+		case 0x03: // RLC E
+			return void(this.e = this.rlc8(this.e));
+		case 0x04: // RLC H
+			return void(this.h = this.rlc8(this.h));
+		case 0x05: // RLC L
+			return void(this.l = this.rlc8(this.l));
+		case 0x06: // RLC (HL)
+			return v = this.l | this.h << 8, this.write(v, this.rlc8(this.read(v)));
+		case 0x07: // RLC A
+			return void(this.a = this.rlc8(this.a));
+		case 0x08: // RRC B
+			return void(this.b = this.rrc8(this.b));
+		case 0x09: // RRC C
+			return void(this.c = this.rrc8(this.c));
+		case 0x0a: // RRC D
+			return void(this.d = this.rrc8(this.d));
+		case 0x0b: // RRC E
+			return void(this.e = this.rrc8(this.e));
+		case 0x0c: // RRC H
+			return void(this.h = this.rrc8(this.h));
+		case 0x0d: // RRC L
+			return void(this.l = this.rrc8(this.l));
+		case 0x0e: // RRC (HL)
+			return v = this.l | this.h << 8, this.write(v, this.rrc8(this.read(v)));
+		case 0x0f: // RRC A
+			return void(this.a = this.rrc8(this.a));
+		case 0x10: // RL B
+			return void(this.b = this.rl8(this.b));
+		case 0x11: // RL C
+			return void(this.c = this.rl8(this.c));
+		case 0x12: // RL D
+			return void(this.d = this.rl8(this.d));
+		case 0x13: // RL E
+			return void(this.e = this.rl8(this.e));
+		case 0x14: // RL H
+			return void(this.h = this.rl8(this.h));
+		case 0x15: // RL L
+			return void(this.l = this.rl8(this.l));
+		case 0x16: // RL (HL)
+			return v = this.l | this.h << 8, this.write(v, this.rl8(this.read(v)));
+		case 0x17: // RL A
+			return void(this.a = this.rl8(this.a));
+		case 0x18: // RR B
+			return void(this.b = this.rr8(this.b));
+		case 0x19: // RR C
+			return void(this.c = this.rr8(this.c));
+		case 0x1a: // RR D
+			return void(this.d = this.rr8(this.d));
+		case 0x1b: // RR E
+			return void(this.e = this.rr8(this.e));
+		case 0x1c: // RR H
+			return void(this.h = this.rr8(this.h));
+		case 0x1d: // RR L
+			return void(this.l = this.rr8(this.l));
+		case 0x1e: // RR (HL)
+			return v = this.l | this.h << 8, this.write(v, this.rr8(this.read(v)));
+		case 0x1f: // RR A
+			return void(this.a = this.rr8(this.a));
+		case 0x20: // SLA B
+			return void(this.b = this.sla8(this.b));
+		case 0x21: // SLA C
+			return void(this.c = this.sla8(this.c));
+		case 0x22: // SLA D
+			return void(this.d = this.sla8(this.d));
+		case 0x23: // SLA E
+			return void(this.e = this.sla8(this.e));
+		case 0x24: // SLA H
+			return void(this.h = this.sla8(this.h));
+		case 0x25: // SLA L
+			return void(this.l = this.sla8(this.l));
+		case 0x26: // SLA (HL)
+			return v = this.l | this.h << 8, this.write(v, this.sla8(this.read(v)));
+		case 0x27: // SLA A
+			return void(this.a = this.sla8(this.a));
+		case 0x28: // SRA B
+			return void(this.b = this.sra8(this.b));
+		case 0x29: // SRA C
+			return void(this.c = this.sra8(this.c));
+		case 0x2a: // SRA D
+			return void(this.d = this.sra8(this.d));
+		case 0x2b: // SRA E
+			return void(this.e = this.sra8(this.e));
+		case 0x2c: // SRA H
+			return void(this.h = this.sra8(this.h));
+		case 0x2d: // SRA L
+			return void(this.l = this.sra8(this.l));
+		case 0x2e: // SRA (HL)
+			return v = this.l | this.h << 8, this.write(v, this.sra8(this.read(v)));
+		case 0x2f: // SRA A
+			return void(this.a = this.sra8(this.a));
+		case 0x30: // undefined opcode
+			return void(this.b = this.sll8(this.b));
+		case 0x31: // undefined opcode
+			return void(this.c = this.sll8(this.c));
+		case 0x32: // undefined opcode
+			return void(this.d = this.sll8(this.d));
+		case 0x33: // undefined opcode
+			return void(this.e = this.sll8(this.e));
+		case 0x34: // undefined opcode
+			return void(this.h = this.sll8(this.h));
+		case 0x35: // undefined opcode
+			return void(this.l = this.sll8(this.l));
+		case 0x36: // undefined opcode
+			return v = this.l | this.h << 8, this.write(v, this.sll8(this.read(v)));
+		case 0x37: // undefined opcode
+			return void(this.a = this.sll8(this.a));
+		case 0x38: // SRL B
+			return void(this.b = this.srl8(this.b));
+		case 0x39: // SRL C
+			return void(this.c = this.srl8(this.c));
+		case 0x3a: // SRL D
+			return void(this.d = this.srl8(this.d));
+		case 0x3b: // SRL E
+			return void(this.e = this.srl8(this.e));
+		case 0x3c: // SRL H
+			return void(this.h = this.srl8(this.h));
+		case 0x3d: // SRL L
+			return void(this.l = this.srl8(this.l));
+		case 0x3e: // SRL (HL)
+			return v = this.l | this.h << 8, this.write(v, this.srl8(this.read(v)));
+		case 0x3f: // SRL A
+			return void(this.a = this.srl8(this.a));
+		case 0x40: // BIT 0,B
+			return this.bit8(0, this.b);
+		case 0x41: // BIT 0,C
+			return this.bit8(0, this.c);
+		case 0x42: // BIT 0,D
+			return this.bit8(0, this.d);
+		case 0x43: // BIT 0,E
+			return this.bit8(0, this.e);
+		case 0x44: // BIT 0,H
+			return this.bit8(0, this.h);
+		case 0x45: // BIT 0,L
+			return this.bit8(0, this.l);
+		case 0x46: // BIT 0,(HL)
+			return this.bit8(0, this.read(this.l | this.h << 8));
+		case 0x47: // BIT 0,A
+			return this.bit8(0, this.a);
+		case 0x48: // BIT 1,B
+			return this.bit8(1, this.b);
+		case 0x49: // BIT 1,C
+			return this.bit8(1, this.c);
+		case 0x4a: // BIT 1,D
+			return this.bit8(1, this.d);
+		case 0x4b: // BIT 1,E
+			return this.bit8(1, this.e);
+		case 0x4c: // BIT 1,H
+			return this.bit8(1, this.h);
+		case 0x4d: // BIT 1,L
+			return this.bit8(1, this.l);
+		case 0x4e: // BIT 1,(HL)
+			return this.bit8(1, this.read(this.l | this.h << 8));
+		case 0x4f: // BIT 1,A
+			return this.bit8(1, this.a);
+		case 0x50: // BIT 2,B
+			return this.bit8(2, this.b);
+		case 0x51: // BIT 2,C
+			return this.bit8(2, this.c);
+		case 0x52: // BIT 2,D
+			return this.bit8(2, this.d);
+		case 0x53: // BIT 2,E
+			return this.bit8(2, this.e);
+		case 0x54: // BIT 2,H
+			return this.bit8(2, this.h);
+		case 0x55: // BIT 2,L
+			return this.bit8(2, this.l);
+		case 0x56: // BIT 2,(HL)
+			return this.bit8(2, this.read(this.l | this.h << 8));
+		case 0x57: // BIT 2,A
+			return this.bit8(2, this.a);
+		case 0x58: // BIT 3,B
+			return this.bit8(3, this.b);
+		case 0x59: // BIT 3,C
+			return this.bit8(3, this.c);
+		case 0x5a: // BIT 3,D
+			return this.bit8(3, this.d);
+		case 0x5b: // BIT 3,E
+			return this.bit8(3, this.e);
+		case 0x5c: // BIT 3,H
+			return this.bit8(3, this.h);
+		case 0x5d: // BIT 3,L
+			return this.bit8(3, this.l);
+		case 0x5e: // BIT 3,(HL)
+			return this.bit8(3, this.read(this.l | this.h << 8));
+		case 0x5f: // BIT 3,A
+			return this.bit8(3, this.a);
+		case 0x60: // BIT 4,B
+			return this.bit8(4, this.b);
+		case 0x61: // BIT 4,C
+			return this.bit8(4, this.c);
+		case 0x62: // BIT 4,D
+			return this.bit8(4, this.d);
+		case 0x63: // BIT 4,E
+			return this.bit8(4, this.e);
+		case 0x64: // BIT 4,H
+			return this.bit8(4, this.h);
+		case 0x65: // BIT 4,L
+			return this.bit8(4, this.l);
+		case 0x66: // BIT 4,(HL)
+			return this.bit8(4, this.read(this.l | this.h << 8));
+		case 0x67: // BIT 4,A
+			return this.bit8(4, this.a);
+		case 0x68: // BIT 5,B
+			return this.bit8(5, this.b);
+		case 0x69: // BIT 5,C
+			return this.bit8(5, this.c);
+		case 0x6a: // BIT 5,D
+			return this.bit8(5, this.d);
+		case 0x6b: // BIT 5,E
+			return this.bit8(5, this.e);
+		case 0x6c: // BIT 5,H
+			return this.bit8(5, this.h);
+		case 0x6d: // BIT 5,L
+			return this.bit8(5, this.l);
+		case 0x6e: // BIT 5,(HL)
+			return this.bit8(5, this.read(this.l | this.h << 8));
+		case 0x6f: // BIT 5,A
+			return this.bit8(5, this.a);
+		case 0x70: // BIT 6,B
+			return this.bit8(6, this.b);
+		case 0x71: // BIT 6,C
+			return this.bit8(6, this.c);
+		case 0x72: // BIT 6,D
+			return this.bit8(6, this.d);
+		case 0x73: // BIT 6,E
+			return this.bit8(6, this.e);
+		case 0x74: // BIT 6,H
+			return this.bit8(6, this.h);
+		case 0x75: // BIT 6,L
+			return this.bit8(6, this.l);
+		case 0x76: // BIT 6,(HL)
+			return this.bit8(6, this.read(this.l | this.h << 8));
+		case 0x77: // BIT 6,A
+			return this.bit8(6, this.a);
+		case 0x78: // BIT 7,B
+			return this.bit8(7, this.b);
+		case 0x79: // BIT 7,C
+			return this.bit8(7, this.c);
+		case 0x7a: // BIT 7,D
+			return this.bit8(7, this.d);
+		case 0x7b: // BIT 7,E
+			return this.bit8(7, this.e);
+		case 0x7c: // BIT 7,H
+			return this.bit8(7, this.h);
+		case 0x7d: // BIT 7,L
+			return this.bit8(7, this.l);
+		case 0x7e: // BIT 7,(HL)
+			return this.bit8(7, this.read(this.l | this.h << 8));
+		case 0x7f: // BIT 7,A
+			return this.bit8(7, this.a);
+		case 0x80: // RES 0,B
+			return void(this.b = this.res8(0, this.b));
+		case 0x81: // RES 0,C
+			return void(this.c = this.res8(0, this.c));
+		case 0x82: // RES 0,D
+			return void(this.d = this.res8(0, this.d));
+		case 0x83: // RES 0,E
+			return void(this.e = this.res8(0, this.e));
+		case 0x84: // RES 0,H
+			return void(this.h = this.res8(0, this.h));
+		case 0x85: // RES 0,L
+			return void(this.l = this.res8(0, this.l));
+		case 0x86: // RES 0,(HL)
+			return v = this.l | this.h << 8, this.write(v, this.res8(0, this.read(v)));
+		case 0x87: // RES 0,A
+			return void(this.a = this.res8(0, this.a));
+		case 0x88: // RES 1,B
+			return void(this.b = this.res8(1, this.b));
+		case 0x89: // RES 1,C
+			return void(this.c = this.res8(1, this.c));
+		case 0x8a: // RES 1,D
+			return void(this.d = this.res8(1, this.d));
+		case 0x8b: // RES 1,E
+			return void(this.e = this.res8(1, this.e));
+		case 0x8c: // RES 1,H
+			return void(this.h = this.res8(1, this.h));
+		case 0x8d: // RES 1,L
+			return void(this.l = this.res8(1, this.l));
+		case 0x8e: // RES 1,(HL)
+			return v = this.l | this.h << 8, this.write(v, this.res8(1, this.read(v)));
+		case 0x8f: // RES 1,A
+			return void(this.a = this.res8(1, this.a));
+		case 0x90: // RES 2,B
+			return void(this.b = this.res8(2, this.b));
+		case 0x91: // RES 2,C
+			return void(this.c = this.res8(2, this.c));
+		case 0x92: // RES 2,D
+			return void(this.d = this.res8(2, this.d));
+		case 0x93: // RES 2,E
+			return void(this.e = this.res8(2, this.e));
+		case 0x94: // RES 2,H
+			return void(this.h = this.res8(2, this.h));
+		case 0x95: // RES 2,L
+			return void(this.l = this.res8(2, this.l));
+		case 0x96: // RES 2,(HL)
+			return v = this.l | this.h << 8, this.write(v, this.res8(2, this.read(v)));
+		case 0x97: // RES 2,A
+			return void(this.a = this.res8(2, this.a));
+		case 0x98: // RES 3,B
+			return void(this.b = this.res8(3, this.b));
+		case 0x99: // RES 3,C
+			return void(this.c = this.res8(3, this.c));
+		case 0x9a: // RES 3,D
+			return void(this.d = this.res8(3, this.d));
+		case 0x9b: // RES 3,E
+			return void(this.e = this.res8(3, this.e));
+		case 0x9c: // RES 3,H
+			return void(this.h = this.res8(3, this.h));
+		case 0x9d: // RES 3,L
+			return void(this.l = this.res8(3, this.l));
+		case 0x9e: // RES 3,(HL)
+			return v = this.l | this.h << 8, this.write(v, this.res8(3, this.read(v)));
+		case 0x9f: // RES 3,A
+			return void(this.a = this.res8(3, this.a));
+		case 0xa0: // RES 4,B
+			return void(this.b = this.res8(4, this.b));
+		case 0xa1: // RES 4,C
+			return void(this.c = this.res8(4, this.c));
+		case 0xa2: // RES 4,D
+			return void(this.d = this.res8(4, this.d));
+		case 0xa3: // RES 4,E
+			return void(this.e = this.res8(4, this.e));
+		case 0xa4: // RES 4,H
+			return void(this.h = this.res8(4, this.h));
+		case 0xa5: // RES 4,L
+			return void(this.l = this.res8(4, this.l));
+		case 0xa6: // RES 4,(HL)
+			return v = this.l | this.h << 8, this.write(v, this.res8(4, this.read(v)));
+		case 0xa7: // RES 4,A
+			return void(this.a = this.res8(4, this.a));
+		case 0xa8: // RES 5,B
+			return void(this.b = this.res8(5, this.b));
+		case 0xa9: // RES 5,C
+			return void(this.c = this.res8(5, this.c));
+		case 0xaa: // RES 5,D
+			return void(this.d = this.res8(5, this.d));
+		case 0xab: // RES 5,E
+			return void(this.e = this.res8(5, this.e));
+		case 0xac: // RES 5,H
+			return void(this.h = this.res8(5, this.h));
+		case 0xad: // RES 5,L
+			return void(this.l = this.res8(5, this.l));
+		case 0xae: // RES 5,(HL)
+			return v = this.l | this.h << 8, this.write(v, this.res8(5, this.read(v)));
+		case 0xaf: // RES 5,A
+			return void(this.a = this.res8(5, this.a));
+		case 0xb0: // RES 6,B
+			return void(this.b = this.res8(6, this.b));
+		case 0xb1: // RES 6,C
+			return void(this.c = this.res8(6, this.c));
+		case 0xb2: // RES 6,D
+			return void(this.d = this.res8(6, this.d));
+		case 0xb3: // RES 6,E
+			return void(this.e = this.res8(6, this.e));
+		case 0xb4: // RES 6,H
+			return void(this.h = this.res8(6, this.h));
+		case 0xb5: // RES 6,L
+			return void(this.l = this.res8(6, this.l));
+		case 0xb6: // RES 6,(HL)
+			return v = this.l | this.h << 8, this.write(v, this.res8(6, this.read(v)));
+		case 0xb7: // RES 6,A
+			return void(this.a = this.res8(6, this.a));
+		case 0xb8: // RES 7,B
+			return void(this.b = this.res8(7, this.b));
+		case 0xb9: // RES 7,C
+			return void(this.c = this.res8(7, this.c));
+		case 0xba: // RES 7,D
+			return void(this.d = this.res8(7, this.d));
+		case 0xbb: // RES 7,E
+			return void(this.e = this.res8(7, this.e));
+		case 0xbc: // RES 7,H
+			return void(this.h = this.res8(7, this.h));
+		case 0xbd: // RES 7,L
+			return void(this.l = this.res8(7, this.l));
+		case 0xbe: // RES 7,(HL)
+			return v = this.l | this.h << 8, this.write(v, this.res8(7, this.read(v)));
+		case 0xbf: // RES 7,A
+			return void(this.a = this.res8(7, this.a));
+		case 0xc0: // SET 0,B
+			return void(this.b = this.set8(0, this.b));
+		case 0xc1: // SET 0,C
+			return void(this.c = this.set8(0, this.c));
+		case 0xc2: // SET 0,D
+			return void(this.d = this.set8(0, this.d));
+		case 0xc3: // SET 0,E
+			return void(this.e = this.set8(0, this.e));
+		case 0xc4: // SET 0,H
+			return void(this.h = this.set8(0, this.h));
+		case 0xc5: // SET 0,L
+			return void(this.l = this.set8(0, this.l));
+		case 0xc6: // SET 0,(HL)
+			return v = this.l | this.h << 8, this.write(v, this.set8(0, this.read(v)));
+		case 0xc7: // SET 0,A
+			return void(this.a = this.set8(0, this.a));
+		case 0xc8: // SET 1,B
+			return void(this.b = this.set8(1, this.b));
+		case 0xc9: // SET 1,C
+			return void(this.c = this.set8(1, this.c));
+		case 0xca: // SET 1,D
+			return void(this.d = this.set8(1, this.d));
+		case 0xcb: // SET 1,E
+			return void(this.e = this.set8(1, this.e));
+		case 0xcc: // SET 1,H
+			return void(this.h = this.set8(1, this.h));
+		case 0xcd: // SET 1,L
+			return void(this.l = this.set8(1, this.l));
+		case 0xce: // SET 1,(HL)
+			return v = this.l | this.h << 8, this.write(v, this.set8(1, this.read(v)));
+		case 0xcf: // SET 1,A
+			return void(this.a = this.set8(1, this.a));
+		case 0xd0: // SET 2,B
+			return void(this.b = this.set8(2, this.b));
+		case 0xd1: // SET 2,C
+			return void(this.c = this.set8(2, this.c));
+		case 0xd2: // SET 2,D
+			return void(this.d = this.set8(2, this.d));
+		case 0xd3: // SET 2,E
+			return void(this.e = this.set8(2, this.e));
+		case 0xd4: // SET 2,H
+			return void(this.h = this.set8(2, this.h));
+		case 0xd5: // SET 2,L
+			return void(this.l = this.set8(2, this.l));
+		case 0xd6: // SET 2,(HL)
+			return v = this.l | this.h << 8, this.write(v, this.set8(2, this.read(v)));
+		case 0xd7: // SET 2,A
+			return void(this.a = this.set8(2, this.a));
+		case 0xd8: // SET 3,B
+			return void(this.b = this.set8(3, this.b));
+		case 0xd9: // SET 3,C
+			return void(this.c = this.set8(3, this.c));
+		case 0xda: // SET 3,D
+			return void(this.d = this.set8(3, this.d));
+		case 0xdb: // SET 3,E
+			return void(this.e = this.set8(3, this.e));
+		case 0xdc: // SET 3,H
+			return void(this.h = this.set8(3, this.h));
+		case 0xdd: // SET 3,L
+			return void(this.l = this.set8(3, this.l));
+		case 0xde: // SET 3,(HL)
+			return v = this.l | this.h << 8, this.write(v, this.set8(3, this.read(v)));
+		case 0xdf: // SET 3,A
+			return void(this.a = this.set8(3, this.a));
+		case 0xe0: // SET 4,B
+			return void(this.b = this.set8(4, this.b));
+		case 0xe1: // SET 4,C
+			return void(this.c = this.set8(4, this.c));
+		case 0xe2: // SET 4,D
+			return void(this.d = this.set8(4, this.d));
+		case 0xe3: // SET 4,E
+			return void(this.e = this.set8(4, this.e));
+		case 0xe4: // SET 4,H
+			return void(this.h = this.set8(4, this.h));
+		case 0xe5: // SET 4,L
+			return void(this.l = this.set8(4, this.l));
+		case 0xe6: // SET 4,(HL)
+			return v = this.l | this.h << 8, this.write(v, this.set8(4, this.read(v)));
+		case 0xe7: // SET 4,A
+			return void(this.a = this.set8(4, this.a));
+		case 0xe8: // SET 5,B
+			return void(this.b = this.set8(5, this.b));
+		case 0xe9: // SET 5,C
+			return void(this.c = this.set8(5, this.c));
+		case 0xea: // SET 5,D
+			return void(this.d = this.set8(5, this.d));
+		case 0xeb: // SET 5,E
+			return void(this.e = this.set8(5, this.e));
+		case 0xec: // SET 5,H
+			return void(this.h = this.set8(5, this.h));
+		case 0xed: // SET 5,L
+			return void(this.l = this.set8(5, this.l));
+		case 0xee: // SET 5,(HL)
+			return v = this.l | this.h << 8, this.write(v, this.set8(5, this.read(v)));
+		case 0xef: // SET 5,A
+			return void(this.a = this.set8(5, this.a));
+		case 0xf0: // SET 6,B
+			return void(this.b = this.set8(6, this.b));
+		case 0xf1: // SET 6,C
+			return void(this.c = this.set8(6, this.c));
+		case 0xf2: // SET 6,D
+			return void(this.d = this.set8(6, this.d));
+		case 0xf3: // SET 6,E
+			return void(this.e = this.set8(6, this.e));
+		case 0xf4: // SET 6,H
+			return void(this.h = this.set8(6, this.h));
+		case 0xf5: // SET 6,L
+			return void(this.l = this.set8(6, this.l));
+		case 0xf6: // SET 6,(HL)
+			return v = this.l | this.h << 8, this.write(v, this.set8(6, this.read(v)));
+		case 0xf7: // SET 6,A
+			return void(this.a = this.set8(6, this.a));
+		case 0xf8: // SET 7,B
+			return void(this.b = this.set8(7, this.b));
+		case 0xf9: // SET 7,C
+			return void(this.c = this.set8(7, this.c));
+		case 0xfa: // SET 7,D
+			return void(this.d = this.set8(7, this.d));
+		case 0xfb: // SET 7,E
+			return void(this.e = this.set8(7, this.e));
+		case 0xfc: // SET 7,H
+			return void(this.h = this.set8(7, this.h));
+		case 0xfd: // SET 7,L
+			return void(this.l = this.set8(7, this.l));
+		case 0xfe: // SET 7,(HL)
+			return v = this.l | this.h << 8, this.write(v, this.set8(7, this.read(v)));
+		case 0xff: // SET 7,A
+			return void(this.a = this.set8(7, this.a));
+		}
+	}
+
+	execute_dd() {
+		let v, op = this.fetchM1();
+		this.cycle -= cc_xy[op], this.r = this.r & 0x80 | this.r + 1 & 0x7f;
+		switch (op) {
+		case 0x09: // ADD IX,BC
+			return void([this.ixl, this.ixh] = this.split(this.add16(this.ixl | this.ixh << 8, this.c | this.b << 8)));
+		case 0x19: // ADD IX,DE
+			return void([this.ixl, this.ixh] = this.split(this.add16(this.ixl | this.ixh << 8, this.e | this.d << 8)));
+		case 0x21: // LD IX,nn
+			return void([this.ixl, this.ixh] = this.split(this.fetch16()));
+		case 0x22: // LD (nn),IX
+			return this.write16(this.fetch16(), this.ixl | this.ixh << 8);
+		case 0x23: // INC IX
+			return void([this.ixl, this.ixh] = this.split((this.ixl | this.ixh << 8) + 1 & 0xffff));
+		case 0x24: // undefined opcode
+			return void(this.ixh = this.inc8(this.ixh));
+		case 0x25: // undefined opcode
+			return void(this.ixh = this.dec8(this.ixh));
+		case 0x26: // undefined opcode
+			return void(this.ixh = this.fetch());
+		case 0x29: // ADD IX,IX
+			return void([this.ixl, this.ixh] = this.split(this.add16(this.ixl | this.ixh << 8, this.ixl | this.ixh << 8)));
+		case 0x2a: // LD IX,(nn)
+			return void([this.ixl, this.ixh] = this.split(this.read16(this.fetch16())));
+		case 0x2b: // DEC IX
+			return void([this.ixl, this.ixh] = this.split((this.ixl | this.ixh << 8) - 1 & 0xffff));
+		case 0x2c: // undefined opcode
+			return void(this.ixl = this.inc8(this.ixl));
+		case 0x2d: // undefined opcode
+			return void(this.ixl = this.dec8(this.ixl));
+		case 0x2e: // undefined opcode
+			return void(this.ixl = this.fetch());
+		case 0x34: // INC (IX+d)
+			return v = this.disp(this.ixh, this.ixl), this.write(v, this.inc8(this.read(v)));
+		case 0x35: // DEC (IX+d)
+			return v = this.disp(this.ixh, this.ixl), this.write(v, this.dec8(this.read(v)));
+		case 0x36: // LD (IX+d),n
+			return v = this.disp(this.ixh, this.ixl), this.write(v, this.fetch());
+		case 0x39: // ADD IX,SP
+			return void([this.ixl, this.ixh] = this.split(this.add16(this.ixl | this.ixh << 8, this.sp)));
+		case 0x44: // undefined opcode
+			return void(this.b = this.ixh);
+		case 0x45: // undefined opcode
+			return void(this.b = this.ixl);
+		case 0x46: // LD B,(IX+d)
+			return void(this.b = this.read(this.disp(this.ixh, this.ixl)));
+		case 0x4c: // undefined opcode
+			return void(this.c = this.ixh);
+		case 0x4d: // undefined opcode
+			return void(this.c = this.ixl);
+		case 0x4e: // LD C,(IX+d)
+			return void(this.c = this.read(this.disp(this.ixh, this.ixl)));
+		case 0x54: // undefined opcode
+			return void(this.d = this.ixh);
+		case 0x55: // undefined opcode
+			return void(this.d = this.ixl);
+		case 0x56: // LD D,(IX+d)
+			return void(this.d = this.read(this.disp(this.ixh, this.ixl)));
+		case 0x5c: // undefined opcode
+			return void(this.e = this.ixh);
+		case 0x5d: // undefined opcode
+			return void(this.e = this.ixl);
+		case 0x5e: // LD E,(IX+d)
+			return void(this.e = this.read(this.disp(this.ixh, this.ixl)));
+		case 0x60: // undefined opcode
+			return void(this.ixh = this.b);
+		case 0x61: // undefined opcode
+			return void(this.ixh = this.c);
+		case 0x62: // undefined opcode
+			return void(this.ixh = this.d);
+		case 0x63: // undefined opcode
+			return void(this.ixh = this.e);
+		case 0x66: // LD H,(IX+d)
+			return void(this.h = this.read(this.disp(this.ixh, this.ixl)));
+		case 0x67: // undefined opcode
+			return void(this.ixh = this.a);
+		case 0x68: // undefined opcode
+			return void(this.ixl = this.b);
+		case 0x69: // undefined opcode
+			return void(this.ixl = this.c);
+		case 0x6a: // undefined opcode
+			return void(this.ixl = this.d);
+		case 0x6b: // undefined opcode
+			return void(this.ixl = this.e);
+		case 0x6e: // LD L,(IX+d)
+			return void(this.l = this.read(this.disp(this.ixh, this.ixl)));
+		case 0x6f: // undefined opcode
+			return void(this.ixl = this.a);
+		case 0x70: // LD (IX+d),B
+			return this.write(this.disp(this.ixh, this.ixl), this.b);
+		case 0x71: // LD (IX+d),C
+			return this.write(this.disp(this.ixh, this.ixl), this.c);
+		case 0x72: // LD (IX+d),D
+			return this.write(this.disp(this.ixh, this.ixl), this.d);
+		case 0x73: // LD (IX+d),E
+			return this.write(this.disp(this.ixh, this.ixl), this.e);
+		case 0x74: // LD (IX+d),H
+			return this.write(this.disp(this.ixh, this.ixl), this.h);
+		case 0x75: // LD (IX+d),L
+			return this.write(this.disp(this.ixh, this.ixl), this.l);
+		case 0x77: // LD (IX+d),A
+			return this.write(this.disp(this.ixh, this.ixl), this.a);
+		case 0x7c: // undefined opcode
+			return void(this.a = this.ixh);
+		case 0x7d: // undefined opcode
+			return void(this.a = this.ixl);
+		case 0x7e: // LD A,(IX+d)
+			return void(this.a = this.read(this.disp(this.ixh, this.ixl)));
+		case 0x84: // undefined opcode
+			return void(this.a = this.add8(this.a, this.ixh));
+		case 0x85: // undefined opcode
+			return void(this.a = this.add8(this.a, this.ixl));
+		case 0x86: // ADD A,(IX+d)
+			return void(this.a = this.add8(this.a, this.read(this.disp(this.ixh, this.ixl))));
+		case 0x8c: // undefined opcode
+			return void(this.a = this.adc8(this.a, this.ixh));
+		case 0x8d: // undefined opcode
+			return void(this.a = this.adc8(this.a, this.ixl));
+		case 0x8e: // ADC A,(IX+d)
+			return void(this.a = this.adc8(this.a, this.read(this.disp(this.ixh, this.ixl))));
+		case 0x94: // undefined opcode
+			return void(this.a = this.sub8(this.a, this.ixh));
+		case 0x95: // undefined opcode
+			return void(this.a = this.sub8(this.a, this.ixl));
+		case 0x96: // SUB (IX+d)
+			return void(this.a = this.sub8(this.a, this.read(this.disp(this.ixh, this.ixl))));
+		case 0x9c: // undefined opcode
+			return void(this.a = this.sbc8(this.a, this.ixh));
+		case 0x9d: // undefined opcode
+			return void(this.a = this.sbc8(this.a, this.ixl));
+		case 0x9e: // SBC A,(IX+d)
+			return void(this.a = this.sbc8(this.a, this.read(this.disp(this.ixh, this.ixl))));
+		case 0xa4: // undefined opcode
+			return void(this.a = this.and8(this.a, this.ixh));
+		case 0xa5: // undefined opcode
+			return void(this.a = this.and8(this.a, this.ixl));
+		case 0xa6: // AND (IX+d)
+			return void(this.a = this.and8(this.a, this.read(this.disp(this.ixh, this.ixl))));
+		case 0xac: // undefined opcode
+			return void(this.a = this.xor8(this.a, this.ixh));
+		case 0xad: // undefined opcode
+			return void(this.a = this.xor8(this.a, this.ixl));
+		case 0xae: // XOR (IX+d)
+			return void(this.a = this.xor8(this.a, this.read(this.disp(this.ixh, this.ixl))));
+		case 0xb4: // undefined opcode
+			return void(this.a = this.or8(this.a, this.ixh));
+		case 0xb5: // undefined opcode
+			return void(this.a = this.or8(this.a, this.ixl));
+		case 0xb6: // OR (IX+d)
+			return void(this.a = this.or8(this.a, this.read(this.disp(this.ixh, this.ixl))));
+		case 0xbc: // undefined opcode
+			return void(this.sub8(this.a, this.ixh));
+		case 0xbd: // undefined opcode
+			return void(this.sub8(this.a, this.ixl));
+		case 0xbe: // CP (IX+d)
+			return void(this.sub8(this.a, this.read(this.disp(this.ixh, this.ixl))));
+		case 0xcb:
+			v = this.disp(this.ixh, this.ixl), this.cycle -= cc_xycb[op = this.fetch()];
+			switch (op) {
+			case 0x00: // undefined opcode
+				return this.write(v, this.b = this.rlc8(this.read(v)));
+			case 0x01: // undefined opcode
+				return this.write(v, this.c = this.rlc8(this.read(v)));
+			case 0x02: // undefined opcode
+				return this.write(v, this.d = this.rlc8(this.read(v)));
+			case 0x03: // undefined opcode
+				return this.write(v, this.e = this.rlc8(this.read(v)));
+			case 0x04: // undefined opcode
+				return this.write(v, this.h = this.rlc8(this.read(v)));
+			case 0x05: // undefined opcode
+				return this.write(v, this.l = this.rlc8(this.read(v)));
+			case 0x06: // RLC (IX+d)
+				return this.write(v, this.rlc8(this.read(v)));
+			case 0x07: // undefined opcode
+				return this.write(v, this.a = this.rlc8(this.read(v)));
+			case 0x08: // undefined opcode
+				return this.write(v, this.b = this.rrc8(this.read(v)));
+			case 0x09: // undefined opcode
+				return this.write(v, this.c = this.rrc8(this.read(v)));
+			case 0x0a: // undefined opcode
+				return this.write(v, this.d = this.rrc8(this.read(v)));
+			case 0x0b: // undefined opcode
+				return this.write(v, this.e = this.rrc8(this.read(v)));
+			case 0x0c: // undefined opcode
+				return this.write(v, this.h = this.rrc8(this.read(v)));
+			case 0x0d: // undefined opcode
+				return this.write(v, this.l = this.rrc8(this.read(v)));
+			case 0x0e: // RRC (IX+d)
+				return this.write(v, this.rrc8(this.read(v)));
+			case 0x0f: // undefined opcode
+				return this.write(v, this.a = this.rrc8(this.read(v)));
+			case 0x10: // undefined opcode
+				return this.write(v, this.b = this.rl8(this.read(v)));
+			case 0x11: // undefined opcode
+				return this.write(v, this.c = this.rl8(this.read(v)));
+			case 0x12: // undefined opcode
+				return this.write(v, this.d = this.rl8(this.read(v)));
+			case 0x13: // undefined opcode
+				return this.write(v, this.e = this.rl8(this.read(v)));
+			case 0x14: // undefined opcode
+				return this.write(v, this.h = this.rl8(this.read(v)));
+			case 0x15: // undefined opcode
+				return this.write(v, this.l = this.rl8(this.read(v)));
+			case 0x16: // RL (IX+d)
+				return this.write(v, this.rl8(this.read(v)));
+			case 0x17: // undefined opcode
+				return this.write(v, this.a = this.rl8(this.read(v)));
+			case 0x18: // undefined opcode
+				return this.write(v, this.b = this.rr8(this.read(v)));
+			case 0x19: // undefined opcode
+				return this.write(v, this.c = this.rr8(this.read(v)));
+			case 0x1a: // undefined opcode
+				return this.write(v, this.d = this.rr8(this.read(v)));
+			case 0x1b: // undefined opcode
+				return this.write(v, this.e = this.rr8(this.read(v)));
+			case 0x1c: // undefined opcode
+				return this.write(v, this.h = this.rr8(this.read(v)));
+			case 0x1d: // undefined opcode
+				return this.write(v, this.l = this.rr8(this.read(v)));
+			case 0x1e: // RR (IX+d)
+				return this.write(v, this.rr8(this.read(v)));
+			case 0x1f: // undefined opcode
+				return this.write(v, this.a = this.rr8(this.read(v)));
+			case 0x20: // undefined opcode
+				return this.write(v, this.b = this.sla8(this.read(v)));
+			case 0x21: // undefined opcode
+				return this.write(v, this.c = this.sla8(this.read(v)));
+			case 0x22: // undefined opcode
+				return this.write(v, this.d = this.sla8(this.read(v)));
+			case 0x23: // undefined opcode
+				return this.write(v, this.e = this.sla8(this.read(v)));
+			case 0x24: // undefined opcode
+				return this.write(v, this.h = this.sla8(this.read(v)));
+			case 0x25: // undefined opcode
+				return this.write(v, this.l = this.sla8(this.read(v)));
+			case 0x26: // SLA (IX+d)
+				return this.write(v, this.sla8(this.read(v)));
+			case 0x27: // undefined opcode
+				return this.write(v, this.a = this.sla8(this.read(v)));
+			case 0x28: // undefined opcode
+				return this.write(v, this.b = this.sra8(this.read(v)));
+			case 0x29: // undefined opcode
+				return this.write(v, this.c = this.sra8(this.read(v)));
+			case 0x2a: // undefined opcode
+				return this.write(v, this.d = this.sra8(this.read(v)));
+			case 0x2b: // undefined opcode
+				return this.write(v, this.e = this.sra8(this.read(v)));
+			case 0x2c: // undefined opcode
+				return this.write(v, this.h = this.sra8(this.read(v)));
+			case 0x2d: // undefined opcode
+				return this.write(v, this.l = this.sra8(this.read(v)));
+			case 0x2e: // SRA (IX+d)
+				return this.write(v, this.sra8(this.read(v)));
+			case 0x2f: // undefined opcode
+				return this.write(v, this.a = this.sra8(this.read(v)));
+			case 0x30: // undefined opcode
+				return this.write(v, this.b = this.sll8(this.read(v)));
+			case 0x31: // undefined opcode
+				return this.write(v, this.c = this.sll8(this.read(v)));
+			case 0x32: // undefined opcode
+				return this.write(v, this.d = this.sll8(this.read(v)));
+			case 0x33: // undefined opcode
+				return this.write(v, this.e = this.sll8(this.read(v)));
+			case 0x34: // undefined opcode
+				return this.write(v, this.h = this.sll8(this.read(v)));
+			case 0x35: // undefined opcode
+				return this.write(v, this.l = this.sll8(this.read(v)));
+			case 0x36: // undefined opcode
+				return this.write(v, this.sll8(this.read(v)));
+			case 0x37: // undefined opcode
+				return this.write(v, this.a = this.sll8(this.read(v)));
+			case 0x38: // undefined opcode
+				return this.write(v, this.b = this.srl8(this.read(v)));
+			case 0x39: // undefined opcode
+				return this.write(v, this.c = this.srl8(this.read(v)));
+			case 0x3a: // undefined opcode
+				return this.write(v, this.d = this.srl8(this.read(v)));
+			case 0x3b: // undefined opcode
+				return this.write(v, this.e = this.srl8(this.read(v)));
+			case 0x3c: // undefined opcode
+				return this.write(v, this.h = this.srl8(this.read(v)));
+			case 0x3d: // undefined opcode
+				return this.write(v, this.l = this.srl8(this.read(v)));
+			case 0x3e: // SRL (IX+d)
+				return this.write(v, this.srl8(this.read(v)));
+			case 0x3f: // undefined opcode
+				return this.write(v, this.a = this.srl8(this.read(v)));
+			case 0x40: case 0x41: case 0x42: case 0x43: case 0x44: case 0x45: case 0x47: // undefined opcode
+			case 0x46: // BIT 0,(IX+d)
+				return this.bit8(0, this.read(v));
+			case 0x48: case 0x49: case 0x4a: case 0x4b: case 0x4c: case 0x4d: case 0x4f: // undefined opcode
+			case 0x4e: // BIT 1,(IX+d)
+				return this.bit8(1, this.read(v));
+			case 0x50: case 0x51: case 0x52: case 0x53: case 0x54: case 0x55: case 0x57: // undefined opcode
+			case 0x56: // BIT 2,(IX+d)
+				return this.bit8(2, this.read(v));
+			case 0x58: case 0x59: case 0x5a: case 0x5b: case 0x5c: case 0x5d: case 0x5f: // undefined opcode
+			case 0x5e: // BIT 3,(IX+d)
+				return this.bit8(3, this.read(v));
+			case 0x60: case 0x61: case 0x62: case 0x63: case 0x64: case 0x65: case 0x67: // undefined opcode
+			case 0x66: // BIT 4,(IX+d)
+				return this.bit8(4, this.read(v));
+			case 0x68: case 0x69: case 0x6a: case 0x6b: case 0x6c: case 0x6d: case 0x6f: // undefined opcode
+			case 0x6e: // BIT 5,(IX+d)
+				return this.bit8(5, this.read(v));
+			case 0x70: case 0x71: case 0x72: case 0x73: case 0x74: case 0x75: case 0x77: // undefined opcode
+			case 0x76: // BIT 6,(IX+d)
+				return this.bit8(6, this.read(v));
+			case 0x78: case 0x79: case 0x7a: case 0x7b: case 0x7c: case 0x7d: case 0x7f: // undefined opcode
+			case 0x7e: // BIT 7,(IX+d)
+				return this.bit8(7, this.read(v));
+			case 0x80: // undefined opcode
+				return this.write(v, this.b = this.res8(0, this.read(v)));
+			case 0x81: // undefined opcode
+				return this.write(v, this.c = this.res8(0, this.read(v)));
+			case 0x82: // undefined opcode
+				return this.write(v, this.d = this.res8(0, this.read(v)));
+			case 0x83: // undefined opcode
+				return this.write(v, this.e = this.res8(0, this.read(v)));
+			case 0x84: // undefined opcode
+				return this.write(v, this.h = this.res8(0, this.read(v)));
+			case 0x85: // undefined opcode
+				return this.write(v, this.l = this.res8(0, this.read(v)));
+			case 0x86: // RES 0,(IX+d)
+				return this.write(v, this.res8(0, this.read(v)));
+			case 0x87: // undefined opcode
+				return this.write(v, this.a = this.res8(0, this.read(v)));
+			case 0x88: // undefined opcode
+				return this.write(v, this.b = this.res8(1, this.read(v)));
+			case 0x89: // undefined opcode
+				return this.write(v, this.c = this.res8(1, this.read(v)));
+			case 0x8a: // undefined opcode
+				return this.write(v, this.d = this.res8(1, this.read(v)));
+			case 0x8b: // undefined opcode
+				return this.write(v, this.e = this.res8(1, this.read(v)));
+			case 0x8c: // undefined opcode
+				return this.write(v, this.h = this.res8(1, this.read(v)));
+			case 0x8d: // undefined opcode
+				return this.write(v, this.l = this.res8(1, this.read(v)));
+			case 0x8e: // RES 1,(IX+d)
+				return this.write(v, this.res8(1, this.read(v)));
+			case 0x8f: // undefined opcode
+				return this.write(v, this.a = this.res8(1, this.read(v)));
+			case 0x90: // undefined opcode
+				return this.write(v, this.b = this.res8(2, this.read(v)));
+			case 0x91: // undefined opcode
+				return this.write(v, this.c = this.res8(2, this.read(v)));
+			case 0x92: // undefined opcode
+				return this.write(v, this.d = this.res8(2, this.read(v)));
+			case 0x93: // undefined opcode
+				return this.write(v, this.e = this.res8(2, this.read(v)));
+			case 0x94: // undefined opcode
+				return this.write(v, this.h = this.res8(2, this.read(v)));
+			case 0x95: // undefined opcode
+				return this.write(v, this.l = this.res8(2, this.read(v)));
+			case 0x96: // RES 2,(IX+d)
+				return this.write(v, this.res8(2, this.read(v)));
+			case 0x97: // undefined opcode
+				return this.write(v, this.a = this.res8(2, this.read(v)));
+			case 0x98: // undefined opcode
+				return this.write(v, this.b = this.res8(3, this.read(v)));
+			case 0x99: // undefined opcode
+				return this.write(v, this.c = this.res8(3, this.read(v)));
+			case 0x9a: // undefined opcode
+				return this.write(v, this.d = this.res8(3, this.read(v)));
+			case 0x9b: // undefined opcode
+				return this.write(v, this.e = this.res8(3, this.read(v)));
+			case 0x9c: // undefined opcode
+				return this.write(v, this.h = this.res8(3, this.read(v)));
+			case 0x9d: // undefined opcode
+				return this.write(v, this.l = this.res8(3, this.read(v)));
+			case 0x9e: // RES 3,(IX+d)
+				return this.write(v, this.res8(3, this.read(v)));
+			case 0x9f: // undefined opcode
+				return this.write(v, this.a = this.res8(3, this.read(v)));
+			case 0xa0: // undefined opcode
+				return this.write(v, this.b = this.res8(4, this.read(v)));
+			case 0xa1: // undefined opcode
+				return this.write(v, this.c = this.res8(4, this.read(v)));
+			case 0xa2: // undefined opcode
+				return this.write(v, this.d = this.res8(4, this.read(v)));
+			case 0xa3: // undefined opcode
+				return this.write(v, this.e = this.res8(4, this.read(v)));
+			case 0xa4: // undefined opcode
+				return this.write(v, this.h = this.res8(4, this.read(v)));
+			case 0xa5: // undefined opcode
+				return this.write(v, this.l = this.res8(4, this.read(v)));
+			case 0xa6: // RES 4,(IX+d)
+				return this.write(v, this.res8(4, this.read(v)));
+			case 0xa7: // undefined opcode
+				return this.write(v, this.a = this.res8(4, this.read(v)));
+			case 0xa8: // undefined opcode
+				return this.write(v, this.b = this.res8(5, this.read(v)));
+			case 0xa9: // undefined opcode
+				return this.write(v, this.c = this.res8(5, this.read(v)));
+			case 0xaa: // undefined opcode
+				return this.write(v, this.d = this.res8(5, this.read(v)));
+			case 0xab: // undefined opcode
+				return this.write(v, this.e = this.res8(5, this.read(v)));
+			case 0xac: // undefined opcode
+				return this.write(v, this.h = this.res8(5, this.read(v)));
+			case 0xad: // undefined opcode
+				return this.write(v, this.l = this.res8(5, this.read(v)));
+			case 0xae: // RES 5,(IX+d)
+				return this.write(v, this.res8(5, this.read(v)));
+			case 0xaf: // undefined opcode
+				return this.write(v, this.a = this.res8(5, this.read(v)));
+			case 0xb0: // undefined opcode
+				return this.write(v, this.b = this.res8(6, this.read(v)));
+			case 0xb1: // undefined opcode
+				return this.write(v, this.c = this.res8(6, this.read(v)));
+			case 0xb2: // undefined opcode
+				return this.write(v, this.d = this.res8(6, this.read(v)));
+			case 0xb3: // undefined opcode
+				return this.write(v, this.e = this.res8(6, this.read(v)));
+			case 0xb4: // undefined opcode
+				return this.write(v, this.h = this.res8(6, this.read(v)));
+			case 0xb5: // undefined opcode
+				return this.write(v, this.l = this.res8(6, this.read(v)));
+			case 0xb6: // RES 6,(IX+d)
+				return this.write(v, this.res8(6, this.read(v)));
+			case 0xb7: // undefined opcode
+				return this.write(v, this.a = this.res8(6, this.read(v)));
+			case 0xb8: // undefined opcode
+				return this.write(v, this.b = this.res8(7, this.read(v)));
+			case 0xb9: // undefined opcode
+				return this.write(v, this.c = this.res8(7, this.read(v)));
+			case 0xba: // undefined opcode
+				return this.write(v, this.d = this.res8(7, this.read(v)));
+			case 0xbb: // undefined opcode
+				return this.write(v, this.e = this.res8(7, this.read(v)));
+			case 0xbc: // undefined opcode
+				return this.write(v, this.h = this.res8(7, this.read(v)));
+			case 0xbd: // undefined opcode
+				return this.write(v, this.l = this.res8(7, this.read(v)));
+			case 0xbe: // RES 7,(IX+d)
+				return this.write(v, this.res8(7, this.read(v)));
+			case 0xbf: // undefined opcode
+				return this.write(v, this.a = this.res8(7, this.read(v)));
+			case 0xc0: // undefined opcode
+				return this.write(v, this.b = this.set8(0, this.read(v)));
+			case 0xc1: // undefined opcode
+				return this.write(v, this.c = this.set8(0, this.read(v)));
+			case 0xc2: // undefined opcode
+				return this.write(v, this.d = this.set8(0, this.read(v)));
+			case 0xc3: // undefined opcode
+				return this.write(v, this.e = this.set8(0, this.read(v)));
+			case 0xc4: // undefined opcode
+				return this.write(v, this.h = this.set8(0, this.read(v)));
+			case 0xc5: // undefined opcode
+				return this.write(v, this.l = this.set8(0, this.read(v)));
+			case 0xc6: // SET 0,(IX+d)
+				return this.write(v, this.set8(0, this.read(v)));
+			case 0xc7: // undefined opcode
+				return this.write(v, this.a = this.set8(0, this.read(v)));
+			case 0xc8: // undefined opcode
+				return this.write(v, this.b = this.set8(1, this.read(v)));
+			case 0xc9: // undefined opcode
+				return this.write(v, this.c = this.set8(1, this.read(v)));
+			case 0xca: // undefined opcode
+				return this.write(v, this.d = this.set8(1, this.read(v)));
+			case 0xcb: // undefined opcode
+				return this.write(v, this.e = this.set8(1, this.read(v)));
+			case 0xcc: // undefined opcode
+				return this.write(v, this.h = this.set8(1, this.read(v)));
+			case 0xcd: // undefined opcode
+				return this.write(v, this.l = this.set8(1, this.read(v)));
+			case 0xce: // SET 1,(IX+d)
+				return this.write(v, this.set8(1, this.read(v)));
+			case 0xcf: // undefined opcode
+				return this.write(v, this.a = this.set8(1, this.read(v)));
+			case 0xd0: // undefined opcode
+				return this.write(v, this.b = this.set8(2, this.read(v)));
+			case 0xd1: // undefined opcode
+				return this.write(v, this.c = this.set8(2, this.read(v)));
+			case 0xd2: // undefined opcode
+				return this.write(v, this.d = this.set8(2, this.read(v)));
+			case 0xd3: // undefined opcode
+				return this.write(v, this.e = this.set8(2, this.read(v)));
+			case 0xd4: // undefined opcode
+				return this.write(v, this.h = this.set8(2, this.read(v)));
+			case 0xd5: // undefined opcode
+				return this.write(v, this.l = this.set8(2, this.read(v)));
+			case 0xd6: // SET 2,(IX+d)
+				return this.write(v, this.set8(2, this.read(v)));
+			case 0xd7: // undefined opcode
+				return this.write(v, this.a = this.set8(2, this.read(v)));
+			case 0xd8: // undefined opcode
+				return this.write(v, this.b = this.set8(3, this.read(v)));
+			case 0xd9: // undefined opcode
+				return this.write(v, this.c = this.set8(3, this.read(v)));
+			case 0xda: // undefined opcode
+				return this.write(v, this.d = this.set8(3, this.read(v)));
+			case 0xdb: // undefined opcode
+				return this.write(v, this.e = this.set8(3, this.read(v)));
+			case 0xdc: // undefined opcode
+				return this.write(v, this.h = this.set8(3, this.read(v)));
+			case 0xdd: // undefined opcode
+				return this.write(v, this.l = this.set8(3, this.read(v)));
+			case 0xde: // SET 3,(IX+d)
+				return this.write(v, this.set8(3, this.read(v)));
+			case 0xdf: // undefined opcode
+				return this.write(v, this.a = this.set8(3, this.read(v)));
+			case 0xe0: // undefined opcode
+				return this.write(v, this.b = this.set8(4, this.read(v)));
+			case 0xe1: // undefined opcode
+				return this.write(v, this.c = this.set8(4, this.read(v)));
+			case 0xe2: // undefined opcode
+				return this.write(v, this.d = this.set8(4, this.read(v)));
+			case 0xe3: // undefined opcode
+				return this.write(v, this.e = this.set8(4, this.read(v)));
+			case 0xe4: // undefined opcode
+				return this.write(v, this.h = this.set8(4, this.read(v)));
+			case 0xe5: // undefined opcode
+				return this.write(v, this.l = this.set8(4, this.read(v)));
+			case 0xe6: // SET 4,(IX+d)
+				return this.write(v, this.set8(4, this.read(v)));
+			case 0xe7: // undefined opcode
+				return this.write(v, this.a = this.set8(4, this.read(v)));
+			case 0xe8: // undefined opcode
+				return this.write(v, this.b = this.set8(5, this.read(v)));
+			case 0xe9: // undefined opcode
+				return this.write(v, this.c = this.set8(5, this.read(v)));
+			case 0xea: // undefined opcode
+				return this.write(v, this.d = this.set8(5, this.read(v)));
+			case 0xeb: // undefined opcode
+				return this.write(v, this.e = this.set8(5, this.read(v)));
+			case 0xec: // undefined opcode
+				return this.write(v, this.h = this.set8(5, this.read(v)));
+			case 0xed: // undefined opcode
+				return this.write(v, this.l = this.set8(5, this.read(v)));
+			case 0xee: // SET 5,(IX+d)
+				return this.write(v, this.set8(5, this.read(v)));
+			case 0xef: // undefined opcode
+				return this.write(v, this.a = this.set8(5, this.read(v)));
+			case 0xf0: // undefined opcode
+				return this.write(v, this.b = this.set8(6, this.read(v)));
+			case 0xf1: // undefined opcode
+				return this.write(v, this.c = this.set8(6, this.read(v)));
+			case 0xf2: // undefined opcode
+				return this.write(v, this.d = this.set8(6, this.read(v)));
+			case 0xf3: // undefined opcode
+				return this.write(v, this.e = this.set8(6, this.read(v)));
+			case 0xf4: // undefined opcode
+				return this.write(v, this.h = this.set8(6, this.read(v)));
+			case 0xf5: // undefined opcode
+				return this.write(v, this.l = this.set8(6, this.read(v)));
+			case 0xf6: // SET 6,(IX+d)
+				return this.write(v, this.set8(6, this.read(v)));
+			case 0xf7: // undefined opcode
+				return this.write(v, this.a = this.set8(6, this.read(v)));
+			case 0xf8: // undefined opcode
+				return this.write(v, this.b = this.set8(7, this.read(v)));
+			case 0xf9: // undefined opcode
+				return this.write(v, this.c = this.set8(7, this.read(v)));
+			case 0xfa: // undefined opcode
+				return this.write(v, this.d = this.set8(7, this.read(v)));
+			case 0xfb: // undefined opcode
+				return this.write(v, this.e = this.set8(7, this.read(v)));
+			case 0xfc: // undefined opcode
+				return this.write(v, this.h = this.set8(7, this.read(v)));
+			case 0xfd: // undefined opcode
+				return this.write(v, this.l = this.set8(7, this.read(v)));
+			case 0xfe: // SET 7,(IX+d)
+				return this.write(v, this.set8(7, this.read(v)));
+			case 0xff: // undefined opcode
+				return this.write(v, this.a = this.set8(7, this.read(v)));
+			default:
+				return;
+			}
+		case 0xe1: // POP IX
+			return void([this.ixl, this.ixh] = this.split(this.pop16()));
+		case 0xe3: // EX (SP),IX
+			return v = this.ixl | this.ixh << 8, [this.ixl, this.ixh] = this.split(this.pop16()), this.push16(v);
+		case 0xe5: // PUSH IX
+			return this.push16(this.ixl | this.ixh << 8);
+		case 0xe9: // JP (IX)
+			return void(this.pc = this.ixl | this.ixh << 8);
+		case 0xf9: // LD SP,IX
+			return void(this.sp = this.ixl | this.ixh << 8);
+		default:
+			this.undefsize = 2;
+			this.undef();
+			return;
+		}
+	}
+
+	execute_ed() {
+		let v, op = this.fetchM1();
+		this.cycle -= cc_ed[op], this.r = this.r & 0x80 | this.r + 1 & 0x7f;
+		switch (op) {
+		case 0x40: // IN B,(C)
+			return void(this.f = this.f & ~0xd6 | fLogic[this.b = this.ioread(this.b, this.c)]);
+		case 0x41: // OUT (C),B
+			return this.iowrite(this.b, this.c, this.b);
+		case 0x42: // SBC HL,BC
+			return void([this.l, this.h] = this.split(this.sbc16(this.l | this.h << 8, this.c | this.b << 8)));
+		case 0x43: // LD (nn),BC
+			return this.write16(this.fetch16(), this.c | this.b << 8);
+		case 0x44: // NEG
+			return void(this.a = this.neg8(this.a));
+		case 0x45: // RETN
+			return this.iff = this.iff & 2 | this.iff >> 1, this.ret(true);
+		case 0x46: // IM 0
+			return void(this.im = 0);
+		case 0x47: // LD I,A
+			return void(this.i = this.a);
+		case 0x48: // IN C,(C)
+			return void(this.f = this.f & ~0xd6 | fLogic[this.c = this.ioread(this.b, this.c)]);
+		case 0x49: // OUT (C),C
+			return this.iowrite(this.b, this.c, this.c);
+		case 0x4a: // ADC HL,BC
+			return void([this.l, this.h] = this.split(this.adc16(this.l | this.h << 8, this.c | this.b << 8)));
+		case 0x4b: // LD BC,(nn)
+			return void([this.c, this.b] = this.split(this.read16(this.fetch16())));
+		case 0x4c: // undefined opcode
+			return void(this.a = this.neg8(this.a));
+		case 0x4d: // RETI
+			return this.ret(true);
+		case 0x4e: // undefined opcode
+			return void(this.im = 0);
+		case 0x4f: // LD R,A
+			return void(this.r = this.a);
+		case 0x50: // IN D,(C)
+			return void(this.f = this.f & ~0xd6 | fLogic[this.d = this.ioread(this.b, this.c)]);
+		case 0x51: // OUT (C),D
+			return this.iowrite(this.b, this.c, this.d);
+		case 0x52: // SBC HL,DE
+			return void([this.l, this.h] = this.split(this.sbc16(this.l | this.h << 8, this.e | this.d << 8)));
+		case 0x53: // LD (nn),DE
+			return this.write16(this.fetch16(), this.e | this.d << 8);
+		case 0x54: // undefined opcode
+			return void(this.a = this.neg8(this.a));
+		case 0x55: // undefined opcode
+			return this.iff = this.iff & 2 | this.iff >> 1, this.ret(true);
+		case 0x56: // IM 1
+			return void(this.im = 1);
+		case 0x57: // LD A,I
+			return void(this.f = this.f & ~0xd6 | fLogic[this.a = this.i] & 0xc0 | this.iff << 1 & 4);
+		case 0x58: // IN E,(C)
+			return void(this.f = this.f & ~0xd6 | fLogic[this.e = this.ioread(this.b, this.c)]);
+		case 0x59: // OUT (C),E
+			return this.iowrite(this.b, this.c, this.e);
+		case 0x5a: // ADC HL,DE
+			return void([this.l, this.h] = this.split(this.adc16(this.l | this.h << 8, this.e | this.d << 8)));
+		case 0x5b: // LD DE,(nn)
+			return void([this.e, this.d] = this.split(this.read16(this.fetch16())));
+		case 0x5c: // undefined opcode
+			return void(this.a = this.neg8(this.a));
+		case 0x5d: // undefined opcode
+			return this.ret(true);
+		case 0x5e: // IM 2
+			return void(this.im = 2);
+		case 0x5f: // LD A,R
+			return void(this.f = this.f & ~0xd6 | fLogic[this.a = this.r] & 0xc0 | this.iff << 1 & 4);
+		case 0x60: // IN H,(C)
+			return void(this.f = this.f & ~0xd6 | fLogic[this.h = this.ioread(this.b, this.c)]);
+		case 0x61: // OUT (C),H
+			return this.iowrite(this.b, this.c, this.h);
+		case 0x62: // SBC HL,HL
+			return void([this.l, this.h] = this.split(this.sbc16(this.l | this.h << 8, this.l | this.h << 8)));
+		case 0x63: // undefined opcode
+			return this.write16(this.fetch16(), this.l | this.h << 8);
+		case 0x64: // undefined opcode
+			return void(this.a = this.neg8(this.a));
+		case 0x65: // undefined opcode
+			return this.iff = this.iff & 2 | this.iff >> 1, this.ret(true);
+		case 0x66: // undefined opcode
+			return void(this.im = 0);
+		case 0x67: // RRD
+			return v = this.read(this.l | this.h << 8) | this.a << 8, this.write(this.l | this.h << 8, v >> 4 & 0xff), void(this.f = this.f & ~0xd6 | fLogic[this.a = this.a & 0xf0 | v & 0x0f]);
+		case 0x68: // IN L,(C)
+			return void(this.f = this.f & ~0xd6 | fLogic[this.l = this.ioread(this.b, this.c)]);
+		case 0x69: // OUT (C),L
+			return this.iowrite(this.b, this.c, this.l);
+		case 0x6a: // ADC HL,HL
+			return void([this.l, this.h] = this.split(this.adc16(this.l | this.h << 8, this.l | this.h << 8)));
+		case 0x6b: // undefined opcode
+			return void([this.l, this.h] = this.split(this.read16(this.fetch16())));
+		case 0x6c: // undefined opcode
+			return void(this.a = this.neg8(this.a));
+		case 0x6d: // undefined opcode
+			return this.ret(true);
+		case 0x6e: // undefined opcode
+			return void(this.im = 0);
+		case 0x6f: // RLD
+			return v = this.a & 0x0f | this.read(this.l | this.h << 8) << 4, this.write(this.l | this.h << 8, v & 0xff), void(this.f = this.f & ~0xd6 | fLogic[this.a = this.a & 0xf0 | v >> 8]);
+		case 0x70: // undefined opcode
+			return void(this.f = this.f & ~0xd6 | fLogic[this.ioread(this.b, this.c)]);
+		case 0x71: // undefined opcode
+			return this.iowrite(this.b, this.c, 0xff);
+		case 0x72: // SBC HL,SP
+			return void([this.l, this.h] = this.split(this.sbc16(this.l | this.h << 8, this.sp)));
+		case 0x73: // LD (nn),SP
+			return this.write16(this.fetch16(), this.sp);
+		case 0x74: // undefined opcode
+			return void(this.a = this.neg8(this.a));
+		case 0x75: // undefined opcode
+			return this.iff = this.iff & 2 | this.iff >> 1, this.ret(true);
+		case 0x76: // undefined opcode
+			return void(this.im = 1);
+		case 0x77: // undefined opcode
+			return;
+		case 0x78: // IN A,(C)
+			return void(this.f = this.f & ~0xd6 | fLogic[this.a = this.ioread(this.b, this.c)]);
+		case 0x79: // OUT (C),A
+			return this.iowrite(this.b, this.c, this.a);
+		case 0x7a: // ADC HL,SP
+			return void([this.l, this.h] = this.split(this.adc16(this.l | this.h << 8, this.sp)));
+		case 0x7b: // LD SP,(nn)
+			return void(this.sp = this.read16(this.fetch16()));
+		case 0x7c: // undefined opcode
+			return void(this.a = this.neg8(this.a));
+		case 0x7d: // undefined opcode
+			return this.ret(true);
+		case 0x7e: // undefined opcode
+			return void(this.im = 2);
+		case 0x7f: // undefined opcode
+			return;
+		case 0xa0: // LDI
+			return this.ldi();
+		case 0xa1: // CPI
+			return this.cpi();
+		case 0xa2: // INI
+			return this.ini();
+		case 0xa3: // OUTI
+			return this.outi();
+		case 0xa8: // LDD
+			return this.ldd();
+		case 0xa9: // CPD
+			return this.cpd();
+		case 0xaa: // IND
+			return this.ind();
+		case 0xab: // OUTD
+			return this.outd();
+		case 0xb0: // LDIR
+			return this.ldi(), void(this.f & 4 && (this.cycle -= cc_ex[0xb0], this.pc = this.pc - 2 & 0xffff));
+		case 0xb1: // CPIR
+			return this.cpi(), void((this.f & 0x44) === 4 && (this.cycle -= cc_ex[0xb1], this.pc = this.pc - 2 & 0xffff));
+		case 0xb2: // INIR
+			return this.ini(), void(~this.f & 0x40 && (this.cycle -= cc_ex[0xb2], this.pc = this.pc - 2 & 0xffff));
+		case 0xb3: // OTIR
+			return this.outi(), void(~this.f & 0x40 && (this.cycle -= cc_ex[0xb3], this.pc = this.pc - 2 & 0xffff));
+		case 0xb8: // LDDR
+			return this.ldd(), void(this.f & 4 && (this.cycle -= cc_ex[0xb8], this.pc = this.pc - 2 & 0xffff));
+		case 0xb9: // CPDR
+			return this.cpd(), void((this.f & 0x44) === 4 && (this.cycle -= cc_ex[0xb9], this.pc = this.pc - 2 & 0xffff));
+		case 0xba: // INDR
+			return this.ind(), void(~this.f & 0x40 && (this.cycle -= cc_ex[0xba], this.pc = this.pc - 2 & 0xffff));
+		case 0xbb: // OTDR
+			return this.outd(), void(~this.f & 0x40 && (this.cycle -= cc_ex[0xbb], this.pc = this.pc - 2 & 0xffff));
+		default:
+			this.undefsize = 2;
+			this.undef();
+			return;
+		}
+	}
+
+	execute_fd() {
+		let v, op = this.fetchM1();
+		this.cycle -= cc_xy[op], this.r = this.r & 0x80 | this.r + 1 & 0x7f;
+		switch (op) {
+		case 0x09: // ADD IY,BC
+			return void([this.iyl, this.iyh] = this.split(this.add16(this.iyl | this.iyh << 8, this.c | this.b << 8)));
+		case 0x19: // ADD IY,DE
+			return void([this.iyl, this.iyh] = this.split(this.add16(this.iyl | this.iyh << 8, this.e | this.d << 8)));
+		case 0x21: // LD IY,nn
+			return void([this.iyl, this.iyh] = this.split(this.fetch16()));
+		case 0x22: // LD (nn),IY
+			return this.write16(this.fetch16(), this.iyl | this.iyh << 8);
+		case 0x23: // INC IY
+			return void([this.iyl, this.iyh] = this.split((this.iyl | this.iyh << 8) + 1 & 0xffff));
+		case 0x24: // undefined opcode
+			return void(this.iyh = this.inc8(this.iyh));
+		case 0x25: // undefined opcode
+			return void(this.iyh = this.dec8(this.iyh));
+		case 0x26: // undefined opcode
+			return void(this.iyh = this.fetch());
+		case 0x29: // ADD IY,IY
+			return void([this.iyl, this.iyh] = this.split(this.add16(this.iyl | this.iyh << 8, this.iyl | this.iyh << 8)));
+		case 0x2a: // LD IY,(nn)
+			return void([this.iyl, this.iyh] = this.split(this.read16(this.fetch16())));
+		case 0x2b: // DEC IY
+			return void([this.iyl, this.iyh] = this.split((this.iyl | this.iyh << 8) - 1 & 0xffff));
+		case 0x2c: // undefined opcode
+			return void(this.iyl = this.inc8(this.iyl));
+		case 0x2d: // undefined opcode
+			return void(this.iyl = this.dec8(this.iyl));
+		case 0x2e: // undefined opcode
+			return void(this.iyl = this.fetch());
+		case 0x34: // INC (IY+d)
+			return v = this.disp(this.iyh, this.iyl), this.write(v, this.inc8(this.read(v)));
+		case 0x35: // DEC (IY+d)
+			return v = this.disp(this.iyh, this.iyl), this.write(v, this.dec8(this.read(v)));
+		case 0x36: // LD (IY+d),n
+			return v = this.disp(this.iyh, this.iyl), this.write(v, this.fetch());
+		case 0x39: // ADD IY,SP
+			return void([this.iyl, this.iyh] = this.split(this.add16(this.iyl | this.iyh << 8, this.sp)));
+		case 0x44: // undefined opcode
+			return void(this.b = this.iyh);
+		case 0x45: // undefined opcode
+			return void(this.b = this.iyl);
+		case 0x46: // LD B,(IY+d)
+			return void(this.b = this.read(this.disp(this.iyh, this.iyl)));
+		case 0x4c: // undefined opcode
+			return void(this.c = this.iyh);
+		case 0x4d: // undefined opcode
+			return void(this.c = this.iyl);
+		case 0x4e: // LD C,(IY+d)
+			return void(this.c = this.read(this.disp(this.iyh, this.iyl)));
+		case 0x54: // undefined opcode
+			return void(this.d = this.iyh);
+		case 0x55: // undefined opcode
+			return void(this.d = this.iyl);
+		case 0x56: // LD D,(IY+d)
+			return void(this.d = this.read(this.disp(this.iyh, this.iyl)));
+		case 0x5c: // undefined opcode
+			return void(this.e = this.iyh);
+		case 0x5d: // undefined opcode
+			return void(this.e = this.iyl);
+		case 0x5e: // LD E,(IY+d)
+			return void(this.e = this.read(this.disp(this.iyh, this.iyl)));
+		case 0x60: // undefined opcode
+			return void(this.iyh = this.b);
+		case 0x61: // undefined opcode
+			return void(this.iyh = this.c);
+		case 0x62: // undefined opcode
+			return void(this.iyh = this.d);
+		case 0x63: // undefined opcode
+			return void(this.iyh = this.e);
+		case 0x66: // LD H,(IY+d)
+			return void(this.h = this.read(this.disp(this.iyh, this.iyl)));
+		case 0x67: // undefined opcode
+			return void(this.iyh = this.a);
+		case 0x68: // undefined opcode
+			return void(this.iyl = this.b);
+		case 0x69: // undefined opcode
+			return void(this.iyl = this.c);
+		case 0x6a: // undefined opcode
+			return void(this.iyl = this.d);
+		case 0x6b: // undefined opcode
+			return void(this.iyl = this.e);
+		case 0x6e: // LD L,(IY+d)
+			return void(this.l = this.read(this.disp(this.iyh, this.iyl)));
+		case 0x6f: // undefined opcode
+			return void(this.iyl = this.a);
+		case 0x70: // LD (IY+d),B
+			return this.write(this.disp(this.iyh, this.iyl), this.b);
+		case 0x71: // LD (IY+d),C
+			return this.write(this.disp(this.iyh, this.iyl), this.c);
+		case 0x72: // LD (IY+d),D
+			return this.write(this.disp(this.iyh, this.iyl), this.d);
+		case 0x73: // LD (IY+d),E
+			return this.write(this.disp(this.iyh, this.iyl), this.e);
+		case 0x74: // LD (IY+d),H
+			return this.write(this.disp(this.iyh, this.iyl), this.h);
+		case 0x75: // LD (IY+d),L
+			return this.write(this.disp(this.iyh, this.iyl), this.l);
+		case 0x77: // LD (IY+d),A
+			return this.write(this.disp(this.iyh, this.iyl), this.a);
+		case 0x7c: // undefined opcode
+			return void(this.a = this.iyh);
+		case 0x7d: // undefined opcode
+			return void(this.a = this.iyl);
+		case 0x7e: // LD A,(IY+d)
+			return void(this.a = this.read(this.disp(this.iyh, this.iyl)));
+		case 0x84: // undefined opcode
+			return void(this.a = this.add8(this.a, this.iyh));
+		case 0x85: // undefined opcode
+			return void(this.a = this.add8(this.a, this.iyl));
+		case 0x86: // ADD A,(IY+d)
+			return void(this.a = this.add8(this.a, this.read(this.disp(this.iyh, this.iyl))));
+		case 0x8c: // undefined opcode
+			return void(this.a = this.adc8(this.a, this.iyh));
+		case 0x8d: // undefined opcode
+			return void(this.a = this.adc8(this.a, this.iyl));
+		case 0x8e: // ADC A,(IY+d)
+			return void(this.a = this.adc8(this.a, this.read(this.disp(this.iyh, this.iyl))));
+		case 0x94: // undefined opcode
+			return void(this.a = this.sub8(this.a, this.iyh));
+		case 0x95: // undefined opcode
+			return void(this.a = this.sub8(this.a, this.iyl));
+		case 0x96: // SUB (IY+d)
+			return void(this.a = this.sub8(this.a, this.read(this.disp(this.iyh, this.iyl))));
+		case 0x9c: // undefined opcode
+			return void(this.a = this.sbc8(this.a, this.iyh));
+		case 0x9d: // undefined opcode
+			return void(this.a = this.sbc8(this.a, this.iyl));
+		case 0x9e: // SBC A,(IY+d)
+			return void(this.a = this.sbc8(this.a, this.read(this.disp(this.iyh, this.iyl))));
+		case 0xa4: // undefined opcode
+			return void(this.a = this.and8(this.a, this.iyh));
+		case 0xa5: // undefined opcode
+			return void(this.a = this.and8(this.a, this.iyl));
+		case 0xa6: // AND (IY+d)
+			return void(this.a = this.and8(this.a, this.read(this.disp(this.iyh, this.iyl))));
+		case 0xac: // undefined opcode
+			return void(this.a = this.xor8(this.a, this.iyh));
+		case 0xad: // undefined opcode
+			return void(this.a = this.xor8(this.a, this.iyl));
+		case 0xae: // XOR (IY+d)
+			return void(this.a = this.xor8(this.a, this.read(this.disp(this.iyh, this.iyl))));
+		case 0xb4: // undefined opcode
+			return void(this.a = this.or8(this.a, this.iyh));
+		case 0xb5: // undefined opcode
+			return void(this.a = this.or8(this.a, this.iyl));
+		case 0xb6: // OR (IY+d)
+			return void(this.a = this.or8(this.a, this.read(this.disp(this.iyh, this.iyl))));
+		case 0xbc: // undefined opcode
+			return void(this.sub8(this.a, this.iyh));
+		case 0xbd: // undefined opcode
+			return void(this.sub8(this.a, this.iyl));
+		case 0xbe: // CP (IY+d)
+			return void(this.sub8(this.a, this.read(this.disp(this.iyh, this.iyl))));
+		case 0xcb:
+			v = this.disp(this.iyh, this.iyl), this.cycle -= cc_xycb[op = this.fetch()];
+			switch (op) {
+			case 0x00: // undefined opcode
+				return this.write(v, this.b = this.rlc8(this.read(v)));
+			case 0x01: // undefined opcode
+				return this.write(v, this.c = this.rlc8(this.read(v)));
+			case 0x02: // undefined opcode
+				return this.write(v, this.d = this.rlc8(this.read(v)));
+			case 0x03: // undefined opcode
+				return this.write(v, this.e = this.rlc8(this.read(v)));
+			case 0x04: // undefined opcode
+				return this.write(v, this.h = this.rlc8(this.read(v)));
+			case 0x05: // undefined opcode
+				return this.write(v, this.l = this.rlc8(this.read(v)));
+			case 0x06: // RLC (IY+d)
+				return this.write(v, this.rlc8(this.read(v)));
+			case 0x07: // undefined opcode
+				return this.write(v, this.a = this.rlc8(this.read(v)));
+			case 0x08: // undefined opcode
+				return this.write(v, this.b = this.rrc8(this.read(v)));
+			case 0x09: // undefined opcode
+				return this.write(v, this.c = this.rrc8(this.read(v)));
+			case 0x0a: // undefined opcode
+				return this.write(v, this.d = this.rrc8(this.read(v)));
+			case 0x0b: // undefined opcode
+				return this.write(v, this.e = this.rrc8(this.read(v)));
+			case 0x0c: // undefined opcode
+				return this.write(v, this.h = this.rrc8(this.read(v)));
+			case 0x0d: // undefined opcode
+				return this.write(v, this.l = this.rrc8(this.read(v)));
+			case 0x0e: // RRC (IY+d)
+				return this.write(v, this.rrc8(this.read(v)));
+			case 0x0f: // undefined opcode
+				return this.write(v, this.a = this.rrc8(this.read(v)));
+			case 0x10: // undefined opcode
+				return this.write(v, this.b = this.rl8(this.read(v)));
+			case 0x11: // undefined opcode
+				return this.write(v, this.c = this.rl8(this.read(v)));
+			case 0x12: // undefined opcode
+				return this.write(v, this.d = this.rl8(this.read(v)));
+			case 0x13: // undefined opcode
+				return this.write(v, this.e = this.rl8(this.read(v)));
+			case 0x14: // undefined opcode
+				return this.write(v, this.h = this.rl8(this.read(v)));
+			case 0x15: // undefined opcode
+				return this.write(v, this.l = this.rl8(this.read(v)));
+			case 0x16: // RL (IY+d)
+				return this.write(v, this.rl8(this.read(v)));
+			case 0x17: // undefined opcode
+				return this.write(v, this.a = this.rl8(this.read(v)));
+			case 0x18: // undefined opcode
+				return this.write(v, this.b = this.rr8(this.read(v)));
+			case 0x19: // undefined opcode
+				return this.write(v, this.c = this.rr8(this.read(v)));
+			case 0x1a: // undefined opcode
+				return this.write(v, this.d = this.rr8(this.read(v)));
+			case 0x1b: // undefined opcode
+				return this.write(v, this.e = this.rr8(this.read(v)));
+			case 0x1c: // undefined opcode
+				return this.write(v, this.h = this.rr8(this.read(v)));
+			case 0x1d: // undefined opcode
+				return this.write(v, this.l = this.rr8(this.read(v)));
+			case 0x1e: // RR (IY+d)
+				return this.write(v, this.rr8(this.read(v)));
+			case 0x1f: // undefined opcode
+				return this.write(v, this.a = this.rr8(this.read(v)));
+			case 0x20: // undefined opcode
+				return this.write(v, this.b = this.sla8(this.read(v)));
+			case 0x21: // undefined opcode
+				return this.write(v, this.c = this.sla8(this.read(v)));
+			case 0x22: // undefined opcode
+				return this.write(v, this.d = this.sla8(this.read(v)));
+			case 0x23: // undefined opcode
+				return this.write(v, this.e = this.sla8(this.read(v)));
+			case 0x24: // undefined opcode
+				return this.write(v, this.h = this.sla8(this.read(v)));
+			case 0x25: // undefined opcode
+				return this.write(v, this.l = this.sla8(this.read(v)));
+			case 0x26: // SLA (IY+d)
+				return this.write(v, this.sla8(this.read(v)));
+			case 0x27: // undefined opcode
+				return this.write(v, this.a = this.sla8(this.read(v)));
+			case 0x28: // undefined opcode
+				return this.write(v, this.b = this.sra8(this.read(v)));
+			case 0x29: // undefined opcode
+				return this.write(v, this.c = this.sra8(this.read(v)));
+			case 0x2a: // undefined opcode
+				return this.write(v, this.d = this.sra8(this.read(v)));
+			case 0x2b: // undefined opcode
+				return this.write(v, this.e = this.sra8(this.read(v)));
+			case 0x2c: // undefined opcode
+				return this.write(v, this.h = this.sra8(this.read(v)));
+			case 0x2d: // undefined opcode
+				return this.write(v, this.l = this.sra8(this.read(v)));
+			case 0x2e: // SRA (IY+d)
+				return this.write(v, this.sra8(this.read(v)));
+			case 0x2f: // undefined opcode
+				return this.write(v, this.a = this.sra8(this.read(v)));
+			case 0x30: // undefined opcode
+				return this.write(v, this.b = this.sll8(this.read(v)));
+			case 0x31: // undefined opcode
+				return this.write(v, this.c = this.sll8(this.read(v)));
+			case 0x32: // undefined opcode
+				return this.write(v, this.d = this.sll8(this.read(v)));
+			case 0x33: // undefined opcode
+				return this.write(v, this.e = this.sll8(this.read(v)));
+			case 0x34: // undefined opcode
+				return this.write(v, this.h = this.sll8(this.read(v)));
+			case 0x35: // undefined opcode
+				return this.write(v, this.l = this.sll8(this.read(v)));
+			case 0x36: // undefined opcode
+				return this.write(v, this.sll8(this.read(v)));
+			case 0x37: // undefined opcode
+				return this.write(v, this.a = this.sll8(this.read(v)));
+			case 0x38: // undefined opcode
+				return this.write(v, this.b = this.srl8(this.read(v)));
+			case 0x39: // undefined opcode
+				return this.write(v, this.c = this.srl8(this.read(v)));
+			case 0x3a: // undefined opcode
+				return this.write(v, this.d = this.srl8(this.read(v)));
+			case 0x3b: // undefined opcode
+				return this.write(v, this.e = this.srl8(this.read(v)));
+			case 0x3c: // undefined opcode
+				return this.write(v, this.h = this.srl8(this.read(v)));
+			case 0x3d: // undefined opcode
+				return this.write(v, this.l = this.srl8(this.read(v)));
+			case 0x3e: // SRL (IY+d)
+				return this.write(v, this.srl8(this.read(v)));
+			case 0x3f: // undefined opcode
+				return this.write(v, this.a = this.srl8(this.read(v)));
+			case 0x40: case 0x41: case 0x42: case 0x43: case 0x44: case 0x45: case 0x47: // undefined opcode
+			case 0x46: // BIT 0,(IY+d)
+				return this.bit8(0, this.read(v));
+			case 0x48: case 0x49: case 0x4a: case 0x4b: case 0x4c: case 0x4d: case 0x4f: // undefined opcode
+			case 0x4e: // BIT 1,(IY+d)
+				return this.bit8(1, this.read(v));
+			case 0x50: case 0x51: case 0x52: case 0x53: case 0x54: case 0x55: case 0x57: // undefined opcode
+			case 0x56: // BIT 2,(IY+d)
+				return this.bit8(2, this.read(v));
+			case 0x58: case 0x59: case 0x5a: case 0x5b: case 0x5c: case 0x5d: case 0x5f: // undefined opcode
+			case 0x5e: // BIT 3,(IY+d)
+				return this.bit8(3, this.read(v));
+			case 0x60: case 0x61: case 0x62: case 0x63: case 0x64: case 0x65: case 0x67: // undefined opcode
+			case 0x66: // BIT 4,(IY+d)
+				return this.bit8(4, this.read(v));
+			case 0x68: case 0x69: case 0x6a: case 0x6b: case 0x6c: case 0x6d: case 0x6f: // undefined opcode
+			case 0x6e: // BIT 5,(IY+d)
+				return this.bit8(5, this.read(v));
+			case 0x70: case 0x71: case 0x72: case 0x73: case 0x74: case 0x75: case 0x77: // undefined opcode
+			case 0x76: // BIT 6,(IY+d)
+				return this.bit8(6, this.read(v));
+			case 0x78: case 0x79: case 0x7a: case 0x7b: case 0x7c: case 0x7d: case 0x7f: // undefined opcode
+			case 0x7e: // BIT 7,(IY+d)
+				return this.bit8(7, this.read(v));
+			case 0x80: // undefined opcode
+				return this.write(v, this.b = this.res8(0, this.read(v)));
+			case 0x81: // undefined opcode
+				return this.write(v, this.c = this.res8(0, this.read(v)));
+			case 0x82: // undefined opcode
+				return this.write(v, this.d = this.res8(0, this.read(v)));
+			case 0x83: // undefined opcode
+				return this.write(v, this.e = this.res8(0, this.read(v)));
+			case 0x84: // undefined opcode
+				return this.write(v, this.h = this.res8(0, this.read(v)));
+			case 0x85: // undefined opcode
+				return this.write(v, this.l = this.res8(0, this.read(v)));
+			case 0x86: // RES 0,(IY+d)
+				return this.write(v, this.res8(0, this.read(v)));
+			case 0x87: // undefined opcode
+				return this.write(v, this.a = this.res8(0, this.read(v)));
+			case 0x88: // undefined opcode
+				return this.write(v, this.b = this.res8(1, this.read(v)));
+			case 0x89: // undefined opcode
+				return this.write(v, this.c = this.res8(1, this.read(v)));
+			case 0x8a: // undefined opcode
+				return this.write(v, this.d = this.res8(1, this.read(v)));
+			case 0x8b: // undefined opcode
+				return this.write(v, this.e = this.res8(1, this.read(v)));
+			case 0x8c: // undefined opcode
+				return this.write(v, this.h = this.res8(1, this.read(v)));
+			case 0x8d: // undefined opcode
+				return this.write(v, this.l = this.res8(1, this.read(v)));
+			case 0x8e: // RES 1,(IY+d)
+				return this.write(v, this.res8(1, this.read(v)));
+			case 0x8f: // undefined opcode
+				return this.write(v, this.a = this.res8(1, this.read(v)));
+			case 0x90: // undefined opcode
+				return this.write(v, this.b = this.res8(2, this.read(v)));
+			case 0x91: // undefined opcode
+				return this.write(v, this.c = this.res8(2, this.read(v)));
+			case 0x92: // undefined opcode
+				return this.write(v, this.d = this.res8(2, this.read(v)));
+			case 0x93: // undefined opcode
+				return this.write(v, this.e = this.res8(2, this.read(v)));
+			case 0x94: // undefined opcode
+				return this.write(v, this.h = this.res8(2, this.read(v)));
+			case 0x95: // undefined opcode
+				return this.write(v, this.l = this.res8(2, this.read(v)));
+			case 0x96: // RES 2,(IY+d)
+				return this.write(v, this.res8(2, this.read(v)));
+			case 0x97: // undefined opcode
+				return this.write(v, this.a = this.res8(2, this.read(v)));
+			case 0x98: // undefined opcode
+				return this.write(v, this.b = this.res8(3, this.read(v)));
+			case 0x99: // undefined opcode
+				return this.write(v, this.c = this.res8(3, this.read(v)));
+			case 0x9a: // undefined opcode
+				return this.write(v, this.d = this.res8(3, this.read(v)));
+			case 0x9b: // undefined opcode
+				return this.write(v, this.e = this.res8(3, this.read(v)));
+			case 0x9c: // undefined opcode
+				return this.write(v, this.h = this.res8(3, this.read(v)));
+			case 0x9d: // undefined opcode
+				return this.write(v, this.l = this.res8(3, this.read(v)));
+			case 0x9e: // RES 3,(IY+d)
+				return this.write(v, this.res8(3, this.read(v)));
+			case 0x9f: // undefined opcode
+				return this.write(v, this.a = this.res8(3, this.read(v)));
+			case 0xa0: // undefined opcode
+				return this.write(v, this.b = this.res8(4, this.read(v)));
+			case 0xa1: // undefined opcode
+				return this.write(v, this.c = this.res8(4, this.read(v)));
+			case 0xa2: // undefined opcode
+				return this.write(v, this.d = this.res8(4, this.read(v)));
+			case 0xa3: // undefined opcode
+				return this.write(v, this.e = this.res8(4, this.read(v)));
+			case 0xa4: // undefined opcode
+				return this.write(v, this.h = this.res8(4, this.read(v)));
+			case 0xa5: // undefined opcode
+				return this.write(v, this.l = this.res8(4, this.read(v)));
+			case 0xa6: // RES 4,(IY+d)
+				return this.write(v, this.res8(4, this.read(v)));
+			case 0xa7: // undefined opcode
+				return this.write(v, this.a = this.res8(4, this.read(v)));
+			case 0xa8: // undefined opcode
+				return this.write(v, this.b = this.res8(5, this.read(v)));
+			case 0xa9: // undefined opcode
+				return this.write(v, this.c = this.res8(5, this.read(v)));
+			case 0xaa: // undefined opcode
+				return this.write(v, this.d = this.res8(5, this.read(v)));
+			case 0xab: // undefined opcode
+				return this.write(v, this.e = this.res8(5, this.read(v)));
+			case 0xac: // undefined opcode
+				return this.write(v, this.h = this.res8(5, this.read(v)));
+			case 0xad: // undefined opcode
+				return this.write(v, this.l = this.res8(5, this.read(v)));
+			case 0xae: // RES 5,(IY+d)
+				return this.write(v, this.res8(5, this.read(v)));
+			case 0xaf: // undefined opcode
+				return this.write(v, this.a = this.res8(5, this.read(v)));
+			case 0xb0: // undefined opcode
+				return this.write(v, this.b = this.res8(6, this.read(v)));
+			case 0xb1: // undefined opcode
+				return this.write(v, this.c = this.res8(6, this.read(v)));
+			case 0xb2: // undefined opcode
+				return this.write(v, this.d = this.res8(6, this.read(v)));
+			case 0xb3: // undefined opcode
+				return this.write(v, this.e = this.res8(6, this.read(v)));
+			case 0xb4: // undefined opcode
+				return this.write(v, this.h = this.res8(6, this.read(v)));
+			case 0xb5: // undefined opcode
+				return this.write(v, this.l = this.res8(6, this.read(v)));
+			case 0xb6: // RES 6,(IY+d)
+				return this.write(v, this.res8(6, this.read(v)));
+			case 0xb7: // undefined opcode
+				return this.write(v, this.a = this.res8(6, this.read(v)));
+			case 0xb8: // undefined opcode
+				return this.write(v, this.b = this.res8(7, this.read(v)));
+			case 0xb9: // undefined opcode
+				return this.write(v, this.c = this.res8(7, this.read(v)));
+			case 0xba: // undefined opcode
+				return this.write(v, this.d = this.res8(7, this.read(v)));
+			case 0xbb: // undefined opcode
+				return this.write(v, this.e = this.res8(7, this.read(v)));
+			case 0xbc: // undefined opcode
+				return this.write(v, this.h = this.res8(7, this.read(v)));
+			case 0xbd: // undefined opcode
+				return this.write(v, this.l = this.res8(7, this.read(v)));
+			case 0xbe: // RES 7,(IY+d)
+				return this.write(v, this.res8(7, this.read(v)));
+			case 0xbf: // undefined opcode
+				return this.write(v, this.a = this.res8(7, this.read(v)));
+			case 0xc0: // undefined opcode
+				return this.write(v, this.b = this.set8(0, this.read(v)));
+			case 0xc1: // undefined opcode
+				return this.write(v, this.c = this.set8(0, this.read(v)));
+			case 0xc2: // undefined opcode
+				return this.write(v, this.d = this.set8(0, this.read(v)));
+			case 0xc3: // undefined opcode
+				return this.write(v, this.e = this.set8(0, this.read(v)));
+			case 0xc4: // undefined opcode
+				return this.write(v, this.h = this.set8(0, this.read(v)));
+			case 0xc5: // undefined opcode
+				return this.write(v, this.l = this.set8(0, this.read(v)));
+			case 0xc6: // SET 0,(IY+d)
+				return this.write(v, this.set8(0, this.read(v)));
+			case 0xc7: // undefined opcode
+				return this.write(v, this.a = this.set8(0, this.read(v)));
+			case 0xc8: // undefined opcode
+				return this.write(v, this.b = this.set8(1, this.read(v)));
+			case 0xc9: // undefined opcode
+				return this.write(v, this.c = this.set8(1, this.read(v)));
+			case 0xca: // undefined opcode
+				return this.write(v, this.d = this.set8(1, this.read(v)));
+			case 0xcb: // undefined opcode
+				return this.write(v, this.e = this.set8(1, this.read(v)));
+			case 0xcc: // undefined opcode
+				return this.write(v, this.h = this.set8(1, this.read(v)));
+			case 0xcd: // undefined opcode
+				return this.write(v, this.l = this.set8(1, this.read(v)));
+			case 0xce: // SET 1,(IY+d)
+				return this.write(v, this.set8(1, this.read(v)));
+			case 0xcf: // undefined opcode
+				return this.write(v, this.a = this.set8(1, this.read(v)));
+			case 0xd0: // undefined opcode
+				return this.write(v, this.b = this.set8(2, this.read(v)));
+			case 0xd1: // undefined opcode
+				return this.write(v, this.c = this.set8(2, this.read(v)));
+			case 0xd2: // undefined opcode
+				return this.write(v, this.d = this.set8(2, this.read(v)));
+			case 0xd3: // undefined opcode
+				return this.write(v, this.e = this.set8(2, this.read(v)));
+			case 0xd4: // undefined opcode
+				return this.write(v, this.h = this.set8(2, this.read(v)));
+			case 0xd5: // undefined opcode
+				return this.write(v, this.l = this.set8(2, this.read(v)));
+			case 0xd6: // SET 2,(IY+d)
+				return this.write(v, this.set8(2, this.read(v)));
+			case 0xd7: // undefined opcode
+				return this.write(v, this.a = this.set8(2, this.read(v)));
+			case 0xd8: // undefined opcode
+				return this.write(v, this.b = this.set8(3, this.read(v)));
+			case 0xd9: // undefined opcode
+				return this.write(v, this.c = this.set8(3, this.read(v)));
+			case 0xda: // undefined opcode
+				return this.write(v, this.d = this.set8(3, this.read(v)));
+			case 0xdb: // undefined opcode
+				return this.write(v, this.e = this.set8(3, this.read(v)));
+			case 0xdc: // undefined opcode
+				return this.write(v, this.h = this.set8(3, this.read(v)));
+			case 0xdd: // undefined opcode
+				return this.write(v, this.l = this.set8(3, this.read(v)));
+			case 0xde: // SET 3,(IY+d)
+				return this.write(v, this.set8(3, this.read(v)));
+			case 0xdf: // undefined opcode
+				return this.write(v, this.a = this.set8(3, this.read(v)));
+			case 0xe0: // undefined opcode
+				return this.write(v, this.b = this.set8(4, this.read(v)));
+			case 0xe1: // undefined opcode
+				return this.write(v, this.c = this.set8(4, this.read(v)));
+			case 0xe2: // undefined opcode
+				return this.write(v, this.d = this.set8(4, this.read(v)));
+			case 0xe3: // undefined opcode
+				return this.write(v, this.e = this.set8(4, this.read(v)));
+			case 0xe4: // undefined opcode
+				return this.write(v, this.h = this.set8(4, this.read(v)));
+			case 0xe5: // undefined opcode
+				return this.write(v, this.l = this.set8(4, this.read(v)));
+			case 0xe6: // SET 4,(IY+d)
+				return this.write(v, this.set8(4, this.read(v)));
+			case 0xe7: // undefined opcode
+				return this.write(v, this.a = this.set8(4, this.read(v)));
+			case 0xe8: // undefined opcode
+				return this.write(v, this.b = this.set8(5, this.read(v)));
+			case 0xe9: // undefined opcode
+				return this.write(v, this.c = this.set8(5, this.read(v)));
+			case 0xea: // undefined opcode
+				return this.write(v, this.d = this.set8(5, this.read(v)));
+			case 0xeb: // undefined opcode
+				return this.write(v, this.e = this.set8(5, this.read(v)));
+			case 0xec: // undefined opcode
+				return this.write(v, this.h = this.set8(5, this.read(v)));
+			case 0xed: // undefined opcode
+				return this.write(v, this.l = this.set8(5, this.read(v)));
+			case 0xee: // SET 5,(IY+d)
+				return this.write(v, this.set8(5, this.read(v)));
+			case 0xef: // undefined opcode
+				return this.write(v, this.a = this.set8(5, this.read(v)));
+			case 0xf0: // undefined opcode
+				return this.write(v, this.b = this.set8(6, this.read(v)));
+			case 0xf1: // undefined opcode
+				return this.write(v, this.c = this.set8(6, this.read(v)));
+			case 0xf2: // undefined opcode
+				return this.write(v, this.d = this.set8(6, this.read(v)));
+			case 0xf3: // undefined opcode
+				return this.write(v, this.e = this.set8(6, this.read(v)));
+			case 0xf4: // undefined opcode
+				return this.write(v, this.h = this.set8(6, this.read(v)));
+			case 0xf5: // undefined opcode
+				return this.write(v, this.l = this.set8(6, this.read(v)));
+			case 0xf6: // SET 6,(IY+d)
+				return this.write(v, this.set8(6, this.read(v)));
+			case 0xf7: // undefined opcode
+				return this.write(v, this.a = this.set8(6, this.read(v)));
+			case 0xf8: // undefined opcode
+				return this.write(v, this.b = this.set8(7, this.read(v)));
+			case 0xf9: // undefined opcode
+				return this.write(v, this.c = this.set8(7, this.read(v)));
+			case 0xfa: // undefined opcode
+				return this.write(v, this.d = this.set8(7, this.read(v)));
+			case 0xfb: // undefined opcode
+				return this.write(v, this.e = this.set8(7, this.read(v)));
+			case 0xfc: // undefined opcode
+				return this.write(v, this.h = this.set8(7, this.read(v)));
+			case 0xfd: // undefined opcode
+				return this.write(v, this.l = this.set8(7, this.read(v)));
+			case 0xfe: // SET 7,(IY+d)
+				return this.write(v, this.set8(7, this.read(v)));
+			case 0xff: // undefined opcode
+				return this.write(v, this.a = this.set8(7, this.read(v)));
+			default:
+				return;
+			}
+		case 0xe1: // POP IY
+			return void([this.iyl, this.iyh] = this.split(this.pop16()));
+		case 0xe3: // EX (SP),IY
+			return v = this.iyl | this.iyh << 8, [this.iyl, this.iyh] = this.split(this.pop16()), this.push16(v);
+		case 0xe5: // PUSH IY
+			return this.push16(this.iyl | this.iyh << 8);
+		case 0xe9: // JP (IY)
+			return void(this.pc = this.iyl | this.iyh << 8);
+		case 0xf9: // LD SP,IY
+			return void(this.sp = this.iyl | this.iyh << 8);
+		default:
+			this.undefsize = 2;
+			this.undef();
+			return;
+		}
+	}
+
+	disp(h, l) {
+		const d = this.fetch();
+		return (l | h << 8) + (d << 24 >> 24) & 0xffff;
+	}
+
+	jr(cond) {
+		const d = this.fetch();
+		if (cond) this.pc = this.pc + (d << 24 >> 24) & 0xffff;
+	}
+
+	ret(cond) {
+		if (cond) this.pc = this.pop16();
+	}
+
+	jp(cond) {
+		const addr = this.fetch16();
+		if (cond) this.pc = addr;
+	}
+
+	call(cond) {
+		const addr = this.fetch16();
+		if (cond) this.rst(addr);
+	}
+
+	rst(addr) {
+		this.push16(this.pc), this.pc = addr;
+	}
+
+	push16(r) {
+		this.sp = this.sp - 1 & 0xffff, this.write(this.sp, r >> 8), this.sp = this.sp - 1 & 0xffff, this.write(this.sp, r & 0xff);
+	}
+
+	pop16() {
+		const r = this.read16(this.sp);
+		return this.sp = this.sp + 2 & 0xffff, r;
+	}
+
+	add8(dst, src) {
+		const r = dst + src & 0xff, v = dst & src & ~r | ~dst & ~src & r, c = dst & src | src & ~r | ~r & dst;
+		return this.f = this.f & ~0xd7 | r & 0x80 | !r << 6 | c << 1 & 0x10 | v >> 5 & 4 | c >> 7 & 1, r;
+	}
+
+	add16(dst, src) {
+		const r = dst + src & 0xffff, c = dst & src | src & ~r | ~r & dst;
+		return this.f = this.f & ~13 | c >> 7 & 0x10 | c >> 15 & 1, r;
+	}
+
+	adc8(dst, src) {
+		const r = dst + src + (this.f & 1) & 0xff, v = dst & src & ~r | ~dst & ~src & r, c = dst & src | src & ~r | ~r & dst;
+		return this.f = this.f & ~0xd7 | r & 0x80 | !r << 6 | c << 1 & 0x10 | v >> 5 & 4 | c >> 7 & 1, r;
+	}
+
+	adc16(dst, src) {
+		const r = dst + src + (this.f & 1) & 0xffff, v = dst & src & ~r | ~dst & ~src & r, c = dst & src | src & ~r | ~r & dst;
+		return this.f = this.f & ~0xd7 | r >> 8 & 0x80 | !r << 6 | c >> 7 & 0x10 | v >> 13 & 4 | c >> 15 & 1, r;
+	}
+
+	sub8(dst, src) {
+		const r = dst - src & 0xff, v = dst & ~src & ~r | ~dst & src & r, c = ~dst & src | src & r | r & ~dst;
+		return this.f = this.f & ~0xd7 | r & 0x80 | !r << 6 | c << 1 & 0x10 | v >> 5 & 4 | 2 | c >> 7 & 1, r;
+	}
+
+	sbc8(dst, src) {
+		const r = dst - src - (this.f & 1) & 0xff, v = dst & ~src & ~r | ~dst & src & r, c = ~dst & src | src & r | r & ~dst;
+		return this.f = this.f & ~0xd7 | r & 0x80 | !r << 6 | c << 1 & 0x10 | v >> 5 & 4 | 2 | c >> 7 & 1, r;
+	}
+
+	sbc16(dst, src) {
+		const r = dst - src - (this.f & 1) & 0xffff, v = dst & ~src & ~r | ~dst & src & r, c = ~dst & src | src & r | r & ~dst;
+		return this.f = this.f & ~0xd7 | r >> 8 & 0x80 | !r << 6 | c >> 7 & 0x10 | v >> 13 & 4 | 2 | c >> 15 & 1, r;
+	}
+
+	and8(dst, src) {
+		const r = dst & src;
+		return this.f = this.f & ~0xd7 | fLogic[r] | 0x10, r;
+	}
+
+	xor8(dst, src) {
+		const r = dst ^ src;
+		return this.f = this.f & ~0xd7 | fLogic[r], r;
+	}
+
+	or8(dst, src) {
+		const r = dst | src;
+		return this.f = this.f & ~0xd7 | fLogic[r], r;
+	}
+
+	inc8(dst) {
+		const r = dst + 1 & 0xff, v = dst & 1 & ~r | ~dst & ~1 & r, c = dst & 1 | 1 & ~r | ~r & dst;
+		return this.f = this.f & ~0xd6 | r & 0x80 | !r << 6 | c << 1 & 0x10 | v >> 5 & 4, r;
+	}
+
+	dec8(dst) {
+		const r = dst - 1 & 0xff, v = dst & ~1 & ~r | ~dst & 1 & r, c = ~dst & 1 | 1 & r | r & ~dst;
+		return this.f = this.f & ~0xd6 | r & 0x80 | !r << 6 | c << 1 & 0x10 | v >> 5 & 4 | 2, r;
+	}
+
+	daa() {
+		let r = this.a;
+		if (this.f & 2) {
+			if (this.f & 0x10 && (r & 0x0f) > 5 || (r & 0x0f) > 9)
+				r -= 6, this.f |= 0x10;
+			if (this.f & 1 && (r & 0xf0) > 0x50 || (r & 0xf0) > 0x90)
+				r -= 0x60, this.f |= 1;
+		} else {
+			if (this.f & 0x10 && (r & 0x0f) < 4 || (r & 0x0f) > 9) {
+				if ((r += 6) >= 0x100)
+					this.f |= 1;
+				this.f |= 0x10;
+			}
+			if (this.f & 1 && (r & 0xf0) < 0x40 || (r & 0xf0) > 0x90)
+				r += 0x60, this.f |= 1;
+		}
+		this.a = r &= 0xff, this.f = this.f & ~0xc4 | fLogic[r];
+	}
+
+	rlc8(dst) {
+		const r = dst << 1 & 0xfe | dst >> 7;
+		return this.f = this.f & ~0xd7 | fLogic[r] | dst >> 7, r;
+	}
+
+	rrc8(dst) {
+		const r = dst << 7 & 0x80 | dst >> 1;
+		return this.f = this.f & ~0xd7 | fLogic[r] | dst & 1, r;
+	}
+
+	rl8(dst) {
+		const r = dst << 1 & 0xfe | this.f & 1;
+		return this.f = this.f & ~0xd7 | fLogic[r] | dst >> 7, r;
+	}
+
+	rr8(dst) {
+		const r = this.f << 7 & 0x80 | dst >> 1;
+		return this.f = this.f & ~0xd7 | fLogic[r] | dst & 1, r;
+	}
+
+	sla8(dst) {
+		const r = dst << 1 & 0xfe;
+		return this.f = this.f & ~0xd7 | fLogic[r] | dst >> 7, r;
+	}
+
+	sra8(dst) {
+		const r = dst & 0x80 | dst >> 1;
+		return this.f = this.f & ~0xd7 | fLogic[r] | dst & 1, r;
+	}
+
+	sll8(dst) {
+		const r = dst << 1 & 0xfe | 1;
+		return this.f = this.f & ~0xd7 | fLogic[r] | dst >> 7, r;
+	}
+
+	srl8(dst) {
+		const r = dst >> 1;
+		return this.f = this.f & ~0xd7 | fLogic[r] | dst & 1, r;
+	}
+
+	bit8(src, dst) {
+		this.f = this.f & ~0x52 | ~dst >> src << 6 & 0x40 | 0x10;
+	}
+
+	set8(src, dst) {
+		return dst | 1 << src;
+	}
+
+	res8(src, dst) {
+		return dst & ~(1 << src);
+	}
+
+	neg8(dst) {
+		const r = -dst & 0xff, v = dst & r, c = dst | r;
+		return this.f = this.f & ~0xd7 | r & 0x80 | !r << 6 | c << 1 & 0x10 | v >> 5 & 4 | 2 | c >> 7 & 1, r;
+	}
+
+	ldi() {
+		this.write(this.e | this.d << 8, this.read(this.l | this.h << 8));
+		[this.e, this.d] = this.split((this.e | this.d << 8) + 1 & 0xffff);
+		[this.l, this.h] = this.split((this.l | this.h << 8) + 1 & 0xffff);
+		[this.c, this.b] = this.split((this.c | this.b << 8) - 1 & 0xffff);
+		this.f = this.f & ~0x16 | ((this.b | this.c) !== 0) << 2;
+	}
+
+	ldd() {
+		this.write(this.e | this.d << 8, this.read(this.l | this.h << 8));
+		[this.e, this.d] = this.split((this.e | this.d << 8) - 1 & 0xffff);
+		[this.l, this.h] = this.split((this.l | this.h << 8) - 1 & 0xffff);
+		[this.c, this.b] = this.split((this.c | this.b << 8) - 1 & 0xffff);
+		this.f = this.f & ~0x16 | ((this.b | this.c) !== 0) << 2;
+	}
+
+	cpi() {
+		const dst = this.a, src = this.read(this.l | this.h << 8), r = dst - src & 0xff, c = ~dst & src | src & r | r & ~dst;
+		[this.l, this.h] = this.split((this.l | this.h << 8) + 1 & 0xffff);
+		[this.c, this.b] = this.split((this.c | this.b << 8) - 1 & 0xffff);
+		this.f = this.f & ~0xd6 | r & 0x80 | !r << 6 | c << 1 & 0x10 | ((this.b | this.c) !== 0) << 2 | 2;
+	}
+
+	cpd() {
+		const dst = this.a, src = this.read(this.l | this.h << 8), r = dst - src & 0xff, c = ~dst & src | src & r | r & ~dst;
+		[this.l, this.h] = this.split((this.l | this.h << 8) - 1 & 0xffff);
+		[this.c, this.b] = this.split((this.c | this.b << 8) - 1 & 0xffff);
+		this.f = this.f & ~0xd6 | r & 0x80 | !r << 6 | c << 1 & 0x10 | ((this.b | this.c) !== 0) << 2 | 2;
+	}
+
+	ini() {
+		this.write(this.l | this.h << 8, this.ioread(this.b, this.c));
+		[this.l, this.h] = this.split((this.l | this.h << 8) + 1 & 0xffff);
+		this.f = this.f & ~0x42 | !(this.b = this.b - 1 & 0xff) << 6 | 2;
+	}
+
+	ind() {
+		this.write(this.l | this.h << 8, this.ioread(this.b, this.c));
+		[this.l, this.h] = this.split((this.l | this.h << 8) - 1 & 0xffff);
+		this.f = this.f & ~0x42 | !(this.b = this.b - 1 & 0xff) << 6 | 2;
+	}
+
+	outi() {
+		this.iowrite(this.b, this.c, this.read(this.l | this.h << 8));
+		[this.l, this.h] = this.split((this.l | this.h << 8) + 1 & 0xffff);
+		this.f = this.f & ~0x42 | !(this.b = this.b - 1 & 0xff) << 6 | 2;
+	}
+
+	outd() {
+		this.iowrite(this.b, this.c, this.read(this.l | this.h << 8));
+		[this.l, this.h] = this.split((this.l | this.h << 8) - 1 & 0xffff);
+		this.f = this.f & ~0x42 | !(this.b = this.b - 1 & 0xff) << 6 | 2;
+	}
+
+	ioread(h, l) {
+		const page = this.iomap[h];
+		return !page.read ? page.base[l] : page.read(l | h << 8);
+	}
+
+	iowrite(h, l, data) {
+		const page = this.iomap[h];
+		!page.write ? void(page.base[l] = data) : page.write(l | h << 8, data);
+	}
+
+	split(v) {
+		return [v & 0xff, v >> 8];
+	}
+
+	fetchM1() {
+//		const page = this.memorymap[this.pc >> 8];
+//		const data = !page.fetch ? page.base[this.pc & 0xff] : page.fetch(this.pc);
+		const data = this.memorymap[this.pc >> 8].base[this.pc & 0xff];
+		return this.pc = this.pc + 1 & 0xffff, data;
+	}
+
+	fetch16() {
+		const data = this.fetch();
+		return data | this.fetch() << 8;
+	}
+
+	read16(addr) {
+		const data = this.read(addr);
+		return data | this.read(addr + 1 & 0xffff) << 8;
+	}
+
+	write16(addr, data) {
+		this.write(addr, data & 0xff), this.write(addr + 1 & 0xffff, data >> 8);
+	}
+}
+
+const fLogic = Uint8Array.from(seq(0x100), e => {
+	let p = e ^ e >> 4;
+	return p ^= p >> 2, p ^= p >> 1, e & 0x80 | !e << 6 | ~p << 2 & 4;
+});
+
+const cc_op = Uint8Array.of(
+	4,10, 7, 6, 4, 4, 7, 4, 4,11, 7, 6, 4, 4, 7, 4,
+	8,10, 7, 6, 4, 4, 7, 4,12,11, 7, 6, 4, 4, 7, 4,
+	7,10,16, 6, 4, 4, 7, 4, 7,11,16, 6, 4, 4, 7, 4,
+	7,10,13, 6,11,11,10, 4, 7,11,13, 6, 4, 4, 7, 4,
+	4, 4, 4, 4, 4, 4, 7, 4, 4, 4, 4, 4, 4, 4, 7, 4,
+	4, 4, 4, 4, 4, 4, 7, 4, 4, 4, 4, 4, 4, 4, 7, 4,
+	4, 4, 4, 4, 4, 4, 7, 4, 4, 4, 4, 4, 4, 4, 7, 4,
+	7, 7, 7, 7, 7, 7, 4, 7, 4, 4, 4, 4, 4, 4, 7, 4,
+	4, 4, 4, 4, 4, 4, 7, 4, 4, 4, 4, 4, 4, 4, 7, 4,
+	4, 4, 4, 4, 4, 4, 7, 4, 4, 4, 4, 4, 4, 4, 7, 4,
+	4, 4, 4, 4, 4, 4, 7, 4, 4, 4, 4, 4, 4, 4, 7, 4,
+	4, 4, 4, 4, 4, 4, 7, 4, 4, 4, 4, 4, 4, 4, 7, 4,
+	5,10,10,10,10,11, 7,11, 5,10,10, 0,10,17, 7,11,
+	5,10,10,11,10,11, 7,11, 5, 4,10,11,10, 0, 7,11,
+	5,10,10,19,10,11, 7,11, 5, 4,10, 4,10, 0, 7,11,
+	5,10,10, 4,10,11, 7,11, 5, 6,10, 4,10, 0, 7,11);
+
+const cc_cb = Uint8Array.of(
+	8, 8, 8, 8, 8, 8,15, 8, 8, 8, 8, 8, 8, 8,15, 8,
+	8, 8, 8, 8, 8, 8,15, 8, 8, 8, 8, 8, 8, 8,15, 8,
+	8, 8, 8, 8, 8, 8,15, 8, 8, 8, 8, 8, 8, 8,15, 8,
+	8, 8, 8, 8, 8, 8,15, 8, 8, 8, 8, 8, 8, 8,15, 8,
+	8, 8, 8, 8, 8, 8,12, 8, 8, 8, 8, 8, 8, 8,12, 8,
+	8, 8, 8, 8, 8, 8,12, 8, 8, 8, 8, 8, 8, 8,12, 8,
+	8, 8, 8, 8, 8, 8,12, 8, 8, 8, 8, 8, 8, 8,12, 8,
+	8, 8, 8, 8, 8, 8,12, 8, 8, 8, 8, 8, 8, 8,12, 8,
+	8, 8, 8, 8, 8, 8,15, 8, 8, 8, 8, 8, 8, 8,15, 8,
+	8, 8, 8, 8, 8, 8,15, 8, 8, 8, 8, 8, 8, 8,15, 8,
+	8, 8, 8, 8, 8, 8,15, 8, 8, 8, 8, 8, 8, 8,15, 8,
+	8, 8, 8, 8, 8, 8,15, 8, 8, 8, 8, 8, 8, 8,15, 8,
+	8, 8, 8, 8, 8, 8,15, 8, 8, 8, 8, 8, 8, 8,15, 8,
+	8, 8, 8, 8, 8, 8,15, 8, 8, 8, 8, 8, 8, 8,15, 8,
+	8, 8, 8, 8, 8, 8,15, 8, 8, 8, 8, 8, 8, 8,15, 8,
+	8, 8, 8, 8, 8, 8,15, 8, 8, 8, 8, 8, 8, 8,15, 8);
+
+const cc_ed = Uint8Array.of(
+	8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
+	8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
+	8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
+	8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
+	12,12,15,20,8,14, 8, 9,12,12,15,20, 8,14, 8, 9,
+	12,12,15,20,8,14, 8, 9,12,12,15,20, 8,14, 8, 9,
+	12,12,15,20,8,14, 8,18,12,12,15,20, 8,14, 8,18,
+	12,12,15,20,8,14, 8, 8,12,12,15,20, 8,14, 8, 8,
+	8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
+	8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
+	16,16,16,16,8, 8, 8, 8,16,16,16,16, 8, 8, 8, 8,
+	16,16,16,16,8, 8, 8, 8,16,16,16,16, 8, 8, 8, 8,
+	8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
+	8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
+	8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
+	8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8);
+
+const cc_xy = Uint8Array.of(
+	4+4,10+4, 7+4, 6+4, 4+4, 4+4, 7+4, 4+4, 4+4,11+4, 7+4, 6+4, 4+4, 4+4, 7+4, 4+4,
+	8+4,10+4, 7+4, 6+4, 4+4, 4+4, 7+4, 4+4,12+4,11+4, 7+4, 6+4, 4+4, 4+4, 7+4, 4+4,
+	7+4,10+4,16+4, 6+4, 4+4, 4+4, 7+4, 4+4, 7+4,11+4,16+4, 6+4, 4+4, 4+4, 7+4, 4+4,
+	7+4,10+4,13+4, 6+4,23  ,23  ,19  , 4+4, 7+4,11+4,13+4, 6+4, 4+4, 4+4, 7+4, 4+4,
+	4+4, 4+4, 4+4, 4+4, 4+4, 4+4,19  , 4+4, 4+4, 4+4, 4+4, 4+4, 4+4, 4+4,19  , 4+4,
+	4+4, 4+4, 4+4, 4+4, 4+4, 4+4,19  , 4+4, 4+4, 4+4, 4+4, 4+4, 4+4, 4+4,19  , 4+4,
+	4+4, 4+4, 4+4, 4+4, 4+4, 4+4,19  , 4+4, 4+4, 4+4, 4+4, 4+4, 4+4, 4+4,19  , 4+4,
+	19 ,19  ,19  ,19  ,19  ,19  , 4+4,19  , 4+4, 4+4, 4+4, 4+4, 4+4, 4+4,19  , 4+4,
+	4+4, 4+4, 4+4, 4+4, 4+4, 4+4,19  , 4+4, 4+4, 4+4, 4+4, 4+4, 4+4, 4+4,19  , 4+4,
+	4+4, 4+4, 4+4, 4+4, 4+4, 4+4,19  , 4+4, 4+4, 4+4, 4+4, 4+4, 4+4, 4+4,19  , 4+4,
+	4+4, 4+4, 4+4, 4+4, 4+4, 4+4,19  , 4+4, 4+4, 4+4, 4+4, 4+4, 4+4, 4+4,19  , 4+4,
+	4+4, 4+4, 4+4, 4+4, 4+4, 4+4,19  , 4+4, 4+4, 4+4, 4+4, 4+4, 4+4, 4+4,19  , 4+4,
+	5+4,10+4,10+4,10+4,10+4,11+4, 7+4,11+4, 5+4,10+4,10+4, 0  ,10+4,17+4, 7+4,11+4,
+	5+4,10+4,10+4,11+4,10+4,11+4, 7+4,11+4, 5+4, 4+4,10+4,11+4,10+4, 4  , 7+4,11+4,
+	5+4,10+4,10+4,19+4,10+4,11+4, 7+4,11+4, 5+4, 4+4,10+4, 4+4,10+4, 4  , 7+4,11+4,
+	5+4,10+4,10+4, 4+4,10+4,11+4, 7+4,11+4, 5+4, 6+4,10+4, 4+4,10+4, 4  , 7+4,11+4);
+
+const cc_xycb = Uint8Array.of(
+	23,23,23,23,23,23,23,23,23,23,23,23,23,23,23,23,
+	23,23,23,23,23,23,23,23,23,23,23,23,23,23,23,23,
+	23,23,23,23,23,23,23,23,23,23,23,23,23,23,23,23,
+	23,23,23,23,23,23,23,23,23,23,23,23,23,23,23,23,
+	20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,
+	20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,
+	20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,
+	20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,20,
+	23,23,23,23,23,23,23,23,23,23,23,23,23,23,23,23,
+	23,23,23,23,23,23,23,23,23,23,23,23,23,23,23,23,
+	23,23,23,23,23,23,23,23,23,23,23,23,23,23,23,23,
+	23,23,23,23,23,23,23,23,23,23,23,23,23,23,23,23,
+	23,23,23,23,23,23,23,23,23,23,23,23,23,23,23,23,
+	23,23,23,23,23,23,23,23,23,23,23,23,23,23,23,23,
+	23,23,23,23,23,23,23,23,23,23,23,23,23,23,23,23,
+	23,23,23,23,23,23,23,23,23,23,23,23,23,23,23,23);
+
+const cc_ex = Uint8Array.of(
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	5, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0,
+	5, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	5, 5, 5, 5, 0, 0, 0, 0, 5, 5, 5, 5, 0, 0, 0, 0,
+	6, 0, 0, 0, 7, 0, 0, 2, 6, 0, 0, 0, 7, 0, 0, 2,
+	6, 0, 0, 0, 7, 0, 0, 2, 6, 0, 0, 0, 7, 0, 0, 2,
+	6, 0, 0, 0, 7, 0, 0, 2, 6, 0, 0, 0, 7, 0, 0, 2,
+	6, 0, 0, 0, 7, 0, 0, 2, 6, 0, 0, 0, 7, 0, 0, 2);
+
+/*
+ *
+ *	Pac-Man Sound Module
+ *
+ */
+
+class PacManSound {
+	snd;
+	clock;
+	gain;
+	output = 0;
+	mute = false;
+	reg = new Uint8Array(0x20);
+	frac = 0;
+
+	constructor({SND, clock = 96000, gain = 0.1}) {
+		this.snd = SND;
+		this.clock = clock;
+		this.gain = gain;
+	}
+
+	control(flag) {
+		this.mute = !flag;
+	}
+
+	write(addr, data) {
+		this.reg[addr & 0x1f] = data & 15;
+	}
+
+	execute(rate) {
+		for (this.frac += this.clock; this.frac >= rate; this.frac -= rate) {
+			const r = this.reg;
+			for (let ch = 0; ch < 15; ch += 5) {
+				let ph = r[ch + 4] << 16 | r[ch + 3] << 12 | r[ch + 2] << 8 | r[ch + 1] << 4 | (ch ? 0 : r[0]);
+				ph += r[ch + 0x14] << 16 | r[ch + 0x13] << 12 | r[ch + 0x12] << 8 | r[ch + 0x11] << 4 | (ch ? 0 : r[0x10]);
+				r[ch + 4] = ph >> 16 & 15, r[ch + 3] = ph >> 12 & 15, r[ch + 2] = ph >> 8, r[ch + 1] = ph >> 4 & 15, !ch && (r[0] = ph & 15);
+			}
+		}
+	}
+
+	update() {
+		this.output = 0;
+		if (this.mute)
+			return;
+		const r = this.reg;
+		for (let ch = 0; ch < 15; ch += 5)
+			this.output += (this.snd[r[ch + 5] << 5 & 0xe0 | r[ch + 4] << 1 | r[ch + 3] >> 3] * 2 / 15 - 1) * r[ch + 0x15] / 15 * this.gain;
+	}
+}
+
+// Galaga Rev. B board. The three Z80s share work RAM and video RAM.
+class Board{
+ constructor(files){
+  this.ram=new Uint8Array(8192);this.cpus=Array.from({length:3},()=>new Z80(3072000));
+  this.irq=[false,false,false];this.command=16;this.switches=false;this.credits=0;this.startEnabled=true;this.startPending=false;this.controls=255;this.stars=new Uint8Array(8);this.scroll=0;
+  this.sound=new PacManSound({SND:files['prom-1.1d']});
+  const programs=[['gg1_1b.3p','gg1_2b.3m','gg1_3.2m','gg1_4b.2l'],['gg1_5b.3f'],['gg1_7b.2c']];
+  this.cpus.forEach((cpu,i)=>{
+   programs[i].forEach((name,bank)=>{for(let p=0;p<16;p++)cpu.memorymap[bank*16+p].base=files[name].subarray(p*256,(p+1)*256)});
+   for(let p=0;p<32;p++){let page=cpu.memorymap[128+p];page.base=this.ram.subarray(p*256,(p+1)*256);page.write=null}
+   for(let p of [0x68,0x70,0x71,0xa0]){let page=cpu.memorymap[p];page.write=(addr,v)=>this.write(addr,v);page.read=addr=>this.read(addr)}
+  });
+  this.cpus[0].reset();
+  this.char=files['gg1_9.4l'];this.obj=new Uint8Array(8192);this.obj.set(files['gg1_11.4d']);this.obj.set(files['gg1_10.4f'],4096);
+  this.charLut=files['prom-4.2n'];this.objLut=files['prom-3.1c'];
+  this.pal=Array.from(files['prom-5.5n'],v=>{const lev=n=>33*(n&1)+71*((n>>1)&1)+151*((n>>2)&1);return (0xff000000|lev(v)|(lev(v>>3)<<8)|(lev((v>>6)<<1)<<16))>>>0});
+  this.pixels=new Uint32Array(224*288);this.starPoints=[];
+  let shift=0;for(let y=0;y<256;y++)for(let x=511;x>=0;x--){shift=(shift*2+(((~shift>>16)^(shift>>4))&1))&0x3ffff;if(!(shift&65536)&&(shift&255)===255)this.starPoints.push([x,y,(~shift>>8)&63])}
+ }
+ read(a){
+  if((a>>8)===0x68)return [3,3,3,1,3,2,2,3][a&7];
+  if((a>>8)===0x71)return this.command;
+  if((a>>8)!==0x70||!(this.command&1))return 255;
+  if((a&15)===0){
+   if(this.switches)return 255;
+   if(this.startPending&&this.startEnabled&&this.credits){this.credits--;this.startEnabled=false}
+   this.startPending=false;return (Math.floor(this.credits/10)<<4)|(this.credits%10);
+  }
+  return (a&15)===1?this.controls:255;
+ }
+ write(a,v){
+  if(a>=0x6800&&a<0x6820)this.sound.write(a,v);
+  else if(a>=0x6820&&a<=0x6822)this.irq[a-0x6820]=a===0x6822?!(v&1):!!(v&1);
+  else if(a===0x6823)for(const c of this.cpus.slice(1))v&1?c.enable():c.disable();
+  else if((a>>8)===0x71){this.command=v;if(v===0xe1)this.ram.fill(0,0x11b5,0x11b9)}
+  else if((a>>8)===0x70&&(this.command&1)&&!(a&15)){
+   switch(v&15){case 1:this.credits=0;this.switches=false;this.startEnabled=true;break;case 2:this.startEnabled=true;break;case 3:this.switches=true;break;case 4:this.switches=false;break;case 5:this.switches=true;this.startEnabled=false;break}
+  }else if((a>>8)===0xa0)this.stars[a&7]=v&1;
+ }
+ input(id,down){
+  if(id===2&&down)this.credits=Math.min(99,this.credits+1);
+  if(id===3&&down)this.startPending=true;
+  const mask=({0:48,6:8,7:2})[id];if(mask)this.controls=down?this.controls&~mask:this.controls|mask;
+ }
+ frame(){
+  const samples=new Float32Array(800);
+  for(let n=0;n<800;n++){for(const cpu of this.cpus)cpu.execute(48000);
+   if(this.command!==16&&this.command&&(n%3===0))this.cpus[0].non_maskable_interrupt();
+   if(this.irq[2]&&n%400===0)this.cpus[2].non_maskable_interrupt();
+   this.sound.execute(48000);this.sound.update();samples[n]=this.sound.output;
+  }
+  for(let i=0;i<2;i++)if(this.irq[i])this.cpus[i].interrupt();
+  this.scroll=(this.scroll+[2,3,4,0,-4,-3,-2,0][this.stars[0]+2*this.stars[1]+4*this.stars[2]]+131072)%131072;return samples;
+ }
+ drawTile(code,color,sx,sy,sprite,fx=false,fy=false){
+  const n=sprite?16:8,rom=sprite?this.obj:this.char,lut=sprite?this.objLut:this.charLut;
+  for(let j=0;j<n;j++)for(let i=0;i<n;i++){
+   let x=fx?n-1-i:i,y=fy?n-1-j:j;
+   const off=sprite?(code&127)*64+(y>>3)*32+(y&7)+(x>>2)*8:code*16+y+(x<4?8:0);
+   const byte=rom[off],bit=3-(x&3),pen=((byte>>(bit+4))&1)*2+((byte>>bit)&1);
+   const ink=lut[(color&63)*4+pen]&15,dx=sx+i,dy=sy+j;
+   if(ink===15||dx<0||dy<0||dx>=288||dy>=224)continue;
+   this.pixels[dx*224+(223-dy)]=this.pal[ink+(sprite?0:16)];
+  }
+ }
+ render(){
+  this.pixels.fill(0xff000000);
+  if(this.stars[5])for(const [x,y,c] of this.starPoints){const dx=((x+this.scroll)&511)>>1,dy=(y+((x+this.scroll)>>9))&255;if(dy<224)this.pixels[(dx+16)*224+223-dy]=0xff000000|((c&3)*80)|(((c>>2)&3)*80<<8)|(((c>>4)&3)*80<<16)}
+  const r=this.ram;
+  for(let k=0;k<128;k+=2){let a=r[0x1b80+k],b=r[0x1b81+k];if(b&2)continue;const wide=(a&4)?2:1,high=(a&8)?2:1;
+   let code=r[0xb80+k]&~((wide-1)|((high-1)<<1));const x=r[0x1381+k]-40+256*(b&1),y=224-r[0x1380+k]-16*(high-1);
+   for(let j=0;j<high;j++)for(let i=0;i<wide;i++)this.drawTile(code+((a&1)?wide-1-i:i)+2*((a&2)?high-1-j:j),r[0xb81+k],x+16*i,y+16*j,true,a&1,a&2);
+  }
+  for(let k=0;k<1024;k++){const col=k&31,row=k>>5;const x=row<2?row+34:row>=30?row-30:col+2;const y=row<2||row>=30?col-2:row-2;this.drawTile(r[k],r[1024+k],8*x,8*y,false)}
+  return this.pixels;
+ }
+}
+
+const bootState={"ram":"JCQ2JCQkJCQkJCQkJCQkJCQkJCQkJCQkJCRLSktKJCQkJDckJCQkJCQkJCQkJCQkJCQkJCQkJCQkJE1MTUwkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQOGxgMHCQREBIRJCQkJBkeASQkJCQkJCQkJCQkJCQkJCQkAAAAAAIkJCQkJCQAACQkJCQkJAMDAQMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMBAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAROTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTk5OTgOAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAAxSAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAAwCAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgKVKlClSpUuXLl27d+7dunTo0KFDhw4cOXLly5YsWbJlypUqVKhRo0ePHj179+7dunTo0KBAgQIECRIkSJAgQYIFCxcvXrx58+bMmDFjx44cOHDhwoQIECFDhgwYMGHChAkSJUuWLVq1a9asWbNnzp07du3atWvXr1++fPnz5s2bN27cuXLly5cvX79+/Pnz586cOHHjx48ePHjw4MGDBg1+AFjAKABawCoAXMAsAF7ALn4BMAFQATQBUgE2AVQBMgFWfkFCQUpBRkFOQUBBSEFEQUx+QBpAIkAeQCZAIEAYQCRAHH4ACAAQAAwAFAASAAoAFgAOf3///v379u3btmzZs2bNmzZs2LFixIkSJUuXLl27duzYsGDAgAABAgQIESJEiBEjR44dO3fv3rx58+bMmDBgwYIECBAgQYIECBEjR44dOnXq1KhRo0eOHTp06dKlS5cvX758+fPmzZo1atQAUqVKlStXr168ePDhwoQIESJFixYsWLBhwoQIESNHjx8+fPjw4MCBAwcPHjx48ePGjBkzZ86dOnTp0qRJkyZNAAAAAAIkAAAAAAIkAAAAAAIkAAAAAAIkAAAAAAIkFyoXCioKFioWDCoMGCoYbty5cuXLlixZs2bMmTJkyJAgQYMGDRs2bNiwYMCAAQMHDhw5cuXKlClTpk2aNGjRokWLFy5dunTp0qVLli1atGjRo0ePHz9+/Pnz5s2aNWvXr169evXq1KlSpEiQIECBAgUKFSpVqlSoUaJFihUqVatXr1+/f/78+fLlypUrVq1atWrVq1euXLhw4MGDBw4dOnXr169fvn369OnTp0+fkQIAIP////9AgACEAACosfY3WzcGCQYJ5s2bNpvbG26buxvsG7GbxBsSm0obKpurG6ybspvIGyCbgxsOGAMb6JuhG4aIGwhuCLuI7wi8CPIIywgskrGSx5IeknkS5RKVElUSVZJWElqSaRKmFgKSYRKGkhgxYgYJMAkwCTALMAswCzALMAswCzALMAvZsmXLlixYsAYJBgnmzZs2m9sbbpu7G+wbsZvEGxKbShsqm6sbrJuym8gbIJuDGw6bOhvom6EbhogbCG4Iu4jvCLwI8gjLCCySsZLHkh6SeRLlEpUSVRJVklYSWpJpEqYQApJhEoaSGDFiBgkwCTAJMAswCzALMAswCzALMAswC9myZcuWLFiwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAAAAAQAAAQABAQEBAAEAAAEAAQEAAQAAAAAAAAAKAAEBAAEBAApMmTJkyZIkSJAgQYIECBEjRowZMmXKlClTp0+ePXr16tSpU6dPnjx48ePGjRs2bdq1atWrV65du3bs2bNnz548efPnz548ePDgwYMGDBkzZs2bNm3atGnSAAMAdQB1mgBSCZECrQIOKfkk/YP8gxAFKcJkAEAHYQTKlSpUqFGjR48ePXv37t26dOjQoECBAgQJEiRIkCBBggULFy9evHnz5syYMWPHjhw4cOHChAgQIUOGDBgwYcKECRIlS5YtWrVr1qxZs2fOnTt27doCkbYGHAZtBQcKsQWAmQA0BgP//yAAAwIGFgcAWAAAAQCbAEQAAwAAHQAAAAABCAAoAACBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAARIkWLFixYsGHChAgRI0ePAAMAAgACAAAAAAADAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABaBAEBAQIBAAAA/1q0aNGjAAAAAAAAAAAAAAAAAAAAAKmULQDUqQIAAJABQAAAdQAVKlWqVKhRokWKFSpVq1evFgIC/gICAuUDlf///////////////wAA//8HDh06deuWKBQAffr06dOnT58/fv379+/evXv27du3bt27d+/fvwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABoLgAAAAAAAAAAeikAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB6KQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAATMNcDGwxfMeMHJxxrMS8EMxB3AU8AEwAXABoAHQAgAACASWJAAIBAAEAAAAAAQAAAbUBtQG1AbUAAAAAAAACAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAgABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAfAQAAAAEAAAAAAAABAQABAAABAAAAAAEAAAAAAAAAChsxG0EbURthG3EbgRuRG6EbsRvBAJIAigCCAHwAdgBwGzdu3bt27NiwYcKFChUqVKlTp06cOXPmzZo0adOmTZs2bNiwYMGCBAkTJkyYMGDAgAEDBw4dO3bt2rRp0qRJkiRIkSNGjRs2bdq1a9atW7Zt27dv379///79+/bt27ZsAoYCAAM2bNixYsSJEiVLly5du3bs2LBgwIAAAQIECBEiRIgRI0eOHTt37968efPmAJgwAMEA//8AAQBAQCAGAAAAAAACAgwGAAAAjh06dOnSpUuXL1++fPnz5s2aNWrUAAAAAAAAAAAHFAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQEBAAAAAAAAAQEBAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAADg4OAAAAAAAASEYsAAAAAAAAAAAAAAAAAAAAAAAACgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABwYHAAEVAAIAAJYJAAAAAAAAAAAAAAAAAAAHAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAqQUMBQ0DfwBoALkAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMAAAAAAAAAAAAAAQAAAAABAAEAAQABAAEAAQABAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAAAAAAEAAQABAAEAAQABAAEAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","cpus":[{"fActive":true,"fSuspend":false,"pc":56,"undefsize":0,"clock":3072000,"frac":0,"cycle":-18,"b":16,"c":0,"d":146,"e":144,"h":8,"l":10,"a":10,"f":33,"ixh":36,"ixl":249,"iyh":41,"iyl":14,"iff":0,"im":1,"i":0,"r":94,"b_prime":0,"c_prime":0,"d_prime":153,"e_prime":184,"h_prime":113,"l_prime":0,"a_prime":194,"f_prime":41,"sp":37020},{"fActive":true,"fSuspend":false,"pc":56,"undefsize":0,"clock":3072000,"frac":0,"cycle":-18,"b":10,"c":17,"d":0,"e":74,"h":14,"l":202,"a":1,"f":48,"ixh":148,"ixl":122,"iyh":255,"iyl":255,"iff":0,"im":1,"i":0,"r":10,"b_prime":255,"c_prime":255,"d_prime":255,"e_prime":255,"h_prime":255,"l_prime":255,"a_prime":255,"f_prime":255,"sp":37118},{"fActive":true,"fSuspend":false,"pc":185,"undefsize":0,"clock":3072000,"frac":0,"cycle":-1,"b":0,"c":0,"d":104,"e":32,"h":154,"l":112,"a":0,"f":104,"ixh":255,"ixl":255,"iyh":255,"iyl":255,"iff":0,"im":0,"i":0,"r":111,"b_prime":255,"c_prime":255,"d_prime":255,"e_prime":255,"h_prime":255,"l_prime":255,"a_prime":255,"f_prime":255,"sp":39680}],"board":{"command":16,"switches":false,"credits":0,"startEnabled":false,"startPending":false,"controls":255,"scroll":776},"irq":[true,true,true],"stars":[0,1,1,1,0,1,0,0],"sound":{"clock":96000,"gain":0.1,"output":0,"mute":false,"frac":0},"soundReg":[0,10,146,9,3,7,12,6,0,8,6,2,14,0,4,7,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]};
+async function loadSet(){
+ const response=await fetch('./galaga.zip');if(!response.ok)throw Error('ROM download failed');
+ const data=new Uint8Array(await response.arrayBuffer()),v=new DataView(data.buffer),files={};
+ let i=0;
+ while(i+30<=data.length&&v.getUint32(i,true)===0x04034b50){
+  const length=v.getUint32(i+18,true),nameLen=v.getUint16(i+26,true),extra=v.getUint16(i+28,true),start=i+30+nameLen+extra;
+  const name=new TextDecoder().decode(data.subarray(i+30,i+30+nameLen)),bytes=data.slice(start,start+length);
+  const method=v.getUint16(i+8,true);
+  if(method===0)files[name]=bytes;
+  else if(method===8)files[name]=new Uint8Array(await new Response(new Blob([bytes]).stream().pipeThrough(new DecompressionStream('deflate-raw'))).arrayBuffer());
+  else throw Error('Unknown ZIP compression');
+  i=start+length;
+ }
+ if(Object.keys(files).length!==14)throw Error('Incomplete Galaga set');
+ return files;
+}
+export {loadSet};
+const WIDTH=400/224;
+const clamp=(x,lo,hi)=>Math.min(hi,Math.max(lo,x));
+function shipRow(k){return k<0x30?(k&4?96:84):k<0x40?44:(k&4?72:60)}
+function berthY(row){return ({44:212,60:236,72:260,84:284,96:308})[row]}
+export class Swarm{
+ constructor(files){
+  this.board=new Board(files);
+  const b=this.board;
+  Object.assign(b,bootState.board);b.ram.set(Uint8Array.from(atob(bootState.ram),c=>c.charCodeAt(0)));b.irq=[...bootState.irq];b.stars.set(bootState.stars);
+  b.cpus.forEach((c,i)=>Object.assign(c,bootState.cpus[i]));Object.assign(b.sound,bootState.sound);b.sound.reg.set(bootState.soundReg);
+  // The duel owns the two pilots. Disable only the single-cabinet ship hit and
+  // beam-contact callbacks, after the board has completed its ROM self-test.
+  for(const [cpu,address,expected] of [[1,0x05ee,0x3a],[0,0x233d,0x3a]]){
+   const page=b.cpus[cpu].memorymap[address>>8];
+   if(page.base[address&255]!==expected)throw Error('Unexpected Galaga board revision');
+   page.base=new Uint8Array(page.base);page.base[address&255]=0xc9;
+  }
+  this.slots=new Map();this.bombs=new Map();this.clock=0;this.stage=1;
+  this.spawnOwner=new Map();
+  // In the sub-CPU's flight interpreter IX points to the path issuing the spawn.
+  const sub=b.cpus[1];
+  sub.memorymap[0x88].write=(address,value)=>{
+   const k=address&255;
+   if(sub.ixh===0x91&&((value===6&&k>=0x68&&k<0x78)||(value===9&&k>=0x38&&k<0x40))){
+    this.spawnOwner.set(k,b.ram[0x1100+sub.ixl+0x10])
+   }
+   b.ram[address-0x8000]=value
+  };
+ }
+ eliminate(e){
+  const r=this.board.ram,k=e.id,status=r[0x800+k];
+  if([3,9].includes(status)){const offset=r[0x801+k];if(offset<=236)r[0x1100+offset+0x13]=0}
+  r[0x1200+k]=0x81;
+  if(r[0x1828]===k){r[0x182b]=0;r[0x1828]=1}
+ }
+ tick(s,dt){
+  const b=this.board,r=b.ram;
+  const rate=r[0x1010]&&!r[0x1008]?0.7:1;
+  this.clock+=dt*60.606060606*rate;
+  while(this.clock>=1){
+   this.clock--;
+   r[0x1362]=clamp(Math.round((s.p[0].x+s.p[1].x)/(2*WIDTH))+8,8,232);
+   b.frame();this.sample(s);
+  }
+ }
+ sample(s){
+  const r=this.board.ram;
+  if(r[0x1821]!==this.stage){this.stage=r[0x1821];this.slots.clear();this.bombs.clear()}
+  s.wave=this.stage||256;
+  const foes=[];
+  for(let k=0;k<0x60;k+=2){
+   const status=r[0x800+k],code=r[0xb80+k]&127,color=r[0xb81+k]&63;
+   if(status===128){this.slots.delete(k);continue}
+   if(![1,2,3,9].includes(status)||!r[0x1380+k])continue;
+   const rawX=r[0x1380+k]-8,rawY=r[0x1381+k]-32+256*(r[0x1b81+k]&1);
+   let e=this.slots.get(k);
+   if(!e){
+    const hp=color===0?2:1;
+    const parent=k>=0x38&&k<0x40?this.slots.get(this.spawnOwner.get(k)):null;
+    e={id:k,h:parent?parent.h.map(h=>h?hp:0):[hp,hp],ready:false,cargo:[false,false],beam:0};this.slots.set(k,e)
+   }
+   if(!e.h[0]&&!e.h[1])continue;
+   const row=shipRow(k),home=berthY(row);
+   if(status===1||status===2)e.ready=true;
+   const challenge=!r[0x1825];
+   e.entry=!e.ready&&!!r[0x1008];
+   const inFlight=e.ready||(!r[0x1008]&&!challenge);
+   // Map the cabinet's fighter line to the upper pilot and its nest to the shared center.
+   const combatY=home-(rawY-row)*(home-64)/(265-row);
+   const entryY=28+rawY*WIDTH;
+   let blend=inFlight?1:0;
+   if(!blend&&!challenge&&status===9)blend=clamp(1-Math.abs(rawY-row)/80,0,1);
+   e.x=rawX*WIDTH;e.y=entryY+(combatY-entryY)*blend;
+   e.rawX=rawX;e.rawY=rawY;e.code=code;e.palette=color;e.r=color<=1?0:color===2?1:2;
+   e.flags=r[0x1b80+k]^(blend<0.5?1:0);e.diving=e.ready&&status!==1;
+   const capture=r[0x1018]&&r[0x1828]===k,phase=r[0x128b];
+   const depth=phase===64?10:phase&128?10-(phase&15):phase&64?10-(phase&15):phase&15;
+   e.beam=capture?clamp(depth/10,0,1):0;e.grab=capture&&phase===64;
+   foes.push(e)
+  }
+  s.foes=foes;
+  const bombs=[];
+  for(let k=0x68;k<0x78;k+=2){
+   if(r[0x800+k]!==6){this.bombs.delete(k);continue}
+   const x=r[0x1380+k]-8,y=r[0x1381+k]-32+256*(r[0x1b81+k]&1);
+   let bomb=this.bombs.get(k);
+   if(!bomb){
+    // A board bomb inherits the shooter's position. Keep independent copies for its living sides.
+    const src=this.slots.get(this.spawnOwner.get(k));
+    if(!src)continue;
+    bomb={rawY:y,start:src.y,live:src.h.map(Boolean)};this.bombs.set(k,bomb)
+   }
+   bomb.x=x*WIDTH;bomb.y=bomb.start+(64-bomb.start)*(y-bomb.rawY)/Math.max(1,265-bomb.rawY);
+   bombs.push(bomb)
+  }
+  s.bombs=bombs
+ }
+}
