@@ -3194,7 +3194,8 @@ export class Swarm{
   sub.memorymap[0x88].write=(address,value)=>{
    const k=address&255;
    if(sub.ixh===0x91&&((value===6&&k>=0x68&&k<0x78)||(value===9&&k>=0x38&&k<0x40))){
-    this.spawnOwner.set(k,b.ram[0x1100+sub.ixl+0x10])
+    this.spawnOwner.set(k,b.ram[0x1100+sub.ixl+0x10]);
+    if(value===6)this.bombs.delete(k);
    }
    b.ram[address-0x8000]=value
   };
@@ -3252,16 +3253,18 @@ export class Swarm{
   s.foes=foes;
   const bombs=[];
   for(let k=0x68;k<0x78;k+=2){
-   if(r[0x800+k]!==6){this.bombs.delete(k);continue}
-   const x=r[0x1380+k]-8,y=r[0x1381+k]-32+256*(r[0x1b81+k]&1);
+   if(r[0x800+k]!==6||!r[0x1300+k]){this.bombs.delete(k);continue}
+   // Use the live object coordinates alongside its live allocation state.
+   // The display copy at 0x1380 still belongs to the previous frame.
+   const x=r[0x1300+k]-8,y=r[0x1301+k]-32+256*(r[0x1b01+k]&1);
    let bomb=this.bombs.get(k);
    if(!bomb){
     // A board bomb inherits the shooter's position. Keep independent copies for its living sides.
     const src=this.slots.get(this.spawnOwner.get(k));
     if(!src)continue;
-    bomb={x:x*WIDTH,rawY:y,start:src.y,live:src.h.map(Boolean)};this.bombs.set(k,bomb)
+    bomb={rawY:y,start:src.y,live:src.h.map(Boolean)};this.bombs.set(k,bomb)
    }
-   // Each shot stays in its launch column for its entire lifetime.
+   bomb.x=x*WIDTH;
    bomb.y=bomb.start-(y-bomb.rawY)*WIDTH;
    bombs.push(bomb)
   }
