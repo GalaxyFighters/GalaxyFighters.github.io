@@ -158,7 +158,7 @@ function aiTarget(s){let p=s.p[1],danger=[...s.shots.filter(b=>b.v<0),...s.bombs
 function step(s,dt){if(s.over)return;s.t+=dt;s.effects=s.effects.filter(f=>s.t-f[2]<.45);const aims=[local,role==='ai'?aiTarget(s):peer];s.p.forEach((p,i)=>{let speed=i&&role==='ai'?174:310;p.respawn=Math.max(0,p.respawn-dt);if(!p.respawn)p.x=limit(p.x+limit(aims[i]-p.x,-speed*dt,speed*dt),p.dual?30:18,p.dual?370:382);p.flash=Math.max(0,p.flash-dt)});for(let i=0;i<2;i++){s.cool[i]=Math.max(0,s.cool[i]-dt);let wants=i?(role==='ai'||peerFire||peerQueued):(firing||queued);if(wants&&!s.p[i].respawn&&s.cool[i]<=0){for(const x of guns(s.p[i]))s.shots.push({x,y:i?83:557,v:i?355:-355,o:i});soundEvent(s,15);s.cool[i]=i===1&&role==='ai'?aiCooldown[difficulty]:.18;if(i)peerQueued=false;else queued=false}}
 swarm.tick(s,dt);updateFighters(s,dt);
 for(const e of s.foes){
- if(!e.entry)continue;
+ if(!e.ready)continue; // Contact becomes dangerous after this invader first reaches formation.
  for(let side=0;side<2;side++){
   const i=1-side;
   if(e.h[side]&&touches(s.p[i],e.x,16)&&Math.abs(mirror(side,e.y)-line(i))<14)hurt(s,i)
