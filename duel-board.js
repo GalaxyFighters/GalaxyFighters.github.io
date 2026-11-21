@@ -3261,7 +3261,9 @@ export class Swarm{
     if(!src)continue;
     bomb={rawY:y,start:src.y,live:src.h.map(Boolean)};this.bombs.set(k,bomb)
    }
-   bomb.x=x*WIDTH;bomb.y=bomb.start+(64-bomb.start)*(y-bomb.rawY)/Math.max(1,265-bomb.rawY);
+   bomb.x=x*WIDTH;
+   // Preserve the arcade shot angle when projecting its travel toward each pilot.
+   bomb.y=bomb.start-(y-bomb.rawY)*WIDTH;
    bombs.push(bomb)
   }
   s.bombs=bombs
