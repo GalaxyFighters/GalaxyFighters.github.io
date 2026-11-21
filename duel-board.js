@@ -3207,8 +3207,7 @@ export class Swarm{
  }
  tick(s,dt){
   const b=this.board,r=b.ram;
-  const rate=r[0x1010]&&!r[0x1008]?0.7:1;
-  this.clock+=dt*60.606060606*rate;
+  this.clock+=dt*60.606060606;
   while(this.clock>=1){
    this.clock--;
    r[0x1362]=clamp(Math.round((s.p[0].x+s.p[1].x)/(2*WIDTH))+8,8,232);
