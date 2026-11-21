@@ -3259,10 +3259,9 @@ export class Swarm{
     // A board bomb inherits the shooter's position. Keep independent copies for its living sides.
     const src=this.slots.get(this.spawnOwner.get(k));
     if(!src)continue;
-    bomb={rawY:y,start:src.y,live:src.h.map(Boolean)};this.bombs.set(k,bomb)
+    bomb={x:x*WIDTH,rawY:y,start:src.y,live:src.h.map(Boolean)};this.bombs.set(k,bomb)
    }
-   bomb.x=x*WIDTH;
-   // Preserve the arcade shot angle when projecting its travel toward each pilot.
+   // Each shot stays in its launch column for its entire lifetime.
    bomb.y=bomb.start-(y-bomb.rawY)*WIDTH;
    bombs.push(bomb)
   }
